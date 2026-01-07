@@ -11,3 +11,13 @@ __pycache__/
 # Outputs
 validation_output*.xlsx
 *.log
+
+# Excel files (inputs/outputs)
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+
+
+
