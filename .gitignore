@@ -12,6 +12,11 @@ __pycache__/
 validation_output*.xlsx
 *.log
 
+# debug and testing
+test.py
+test
+
+
 # Excel files (inputs/outputs)
 *.xlsx
 *.xls
