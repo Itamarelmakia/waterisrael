@@ -46,6 +46,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Output Excel filename/path",
     )
     parser.add_argument(
+    "--enable-llm",
+    action="store_true",
+    help="Enable OpenAI LLM fallback (requires OPENAI_API_KEY)",
+    )
+
+    parser.add_argument(
         "--rules",
         type=str,
         default="all",
@@ -107,6 +113,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     cfg = PlanConfig(sheet_name="סיכום תכנית השקעות", header_lookback_rows=6)
     cfg.asset_ratio_rows_excel = {"מים": 20, "ביוב": 21, "סה\"כ": 22}
+
+    cfg.llm_enabled = bool(args.enable_llm)
 
     all_dfs = []
     for plan_path in plan_files:

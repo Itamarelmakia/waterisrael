@@ -1,8 +1,6 @@
 import json
+import os
 from typing import Tuple, Optional
-from openai import OpenAI
-
-client = OpenAI()
 
 ALLOWED = ["השקעה", "שיקום", "שיקום / שדרוג", "תחזוקה / שוטף"]
 
@@ -18,11 +16,18 @@ def _extract_label(text: str) -> Optional[str]:
             return lab
     return None
 
+def _get_client():
+    # import כאן כדי שלא יהיה תלות בזמן import של המודול
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    return OpenAI(api_key=api_key)
+
 def classify_funding_with_confidence(prompt: str, model: str = "gpt-4o") -> Tuple[str, float]:
-    """
-    Returns (label, confidence). Confidence in [0,1].
-    If parsing fails, tries to salvage label; confidence becomes low (0.3).
-    """
+    client = _get_client()
+
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -41,26 +46,22 @@ def classify_funding_with_confidence(prompt: str, model: str = "gpt-4o") -> Tupl
 
     raw = (resp.choices[0].message.content or "").strip()
 
-    # 1) Try JSON
     try:
         obj = json.loads(raw)
         label = str(obj.get("label", "")).strip()
         conf = obj.get("confidence", 0.0)
         if label not in ALLOWED:
-            # salvage
             salv = _extract_label(raw)
             if salv:
                 return salv, 0.3
             return label, 0.0
         return label, _clamp01(conf)
     except Exception:
-        # 2) Salvage label from text
         salv = _extract_label(raw)
         if salv:
             return salv, 0.3
         return raw[:50], 0.0
 
-# Backward compatible function (if you still call classify_text somewhere)
 def classify_text(prompt: str, model: str = "gpt-4o") -> str:
     label, _ = classify_funding_with_confidence(prompt, model=model)
     return label

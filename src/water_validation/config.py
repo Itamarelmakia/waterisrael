@@ -52,7 +52,7 @@ class PlanConfig:
     water_pipe_rows_excel: Tuple[int, int] = (56, 57)
     sewer_pipe_row_excel: int = 58
 
-    llm_enabled: bool = True
+    # llm_enabled: bool = False # Itamar: commented to enable LLM by default
     llm_model: str = "gpt-4o-mini"
     llm_validate_all: bool = True
 
