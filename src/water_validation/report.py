@@ -5,6 +5,7 @@ import re
 import json
 import pandas as pd
 
+from pathlib import Path
 # --- RULE DETAILS (פירוט הבדיקה) ---
 RULE_DETAILS = {
     "R_1": "השוואת ערכי כינון לפי קובץ השקעות וביצוע לבין ערכי הכינון",
@@ -246,181 +247,264 @@ def build_executive_summary(all_checks_df: pd.DataFrame) -> pd.DataFrame:
     return headline, counts, fails, top_rules
 
 
-import re
+
 
 def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
     """
     Summary_Table (Hebrew):
-    מזהה בדיקה | שם הבדיקה | פירוט הבדיקה | רמת בדיקה | מיקום הבדיקה | סטטוס | ממצאים | הערות | הערת משתמש | פעולה נדרשת מול התאגיד
+    שם קובץ | שם הבדיקה | פירוט הבדיקה | מיקום הבדיקה | ממצאים | סטטוס | הערות | הערת משתמש | פעולה נדרשת מול התאגיד
     """
+
+    FINAL_COLS = [
+        "שם קובץ",
+        "שם הבדיקה",
+        "פירוט הבדיקה",
+        "מיקום הבדיקה",
+        "ממצאים",
+        "סטטוס",
+        "הערות",
+        "הערת משתמש",
+        "פעולה נדרשת מול התאגיד",
+    ]
+
+    if all_checks_df is None or len(all_checks_df) == 0:
+        return pd.DataFrame(columns=FINAL_COLS)
 
     df = all_checks_df.copy()
 
-    # ---------- 1) Normalize check id ----------
-    def extract_check_id(rule_id: str) -> str:
-        """
-        Works for:
-          R_1_... -> R_1
-          R_001_... -> R_1
-          R_2_03_... -> R_2_3
-          R_2_3_... -> R_2_3
-        """
-        if rule_id is None:
-            return ""
-        s = str(rule_id).strip()
-        if not s.startswith("R_"):
-            return ""
-        parts = [p.strip() for p in s.split("_") if p.strip()]
-        if len(parts) < 2 or not parts[1].isdigit():
-            return ""
-        a = int(parts[1])
-        if len(parts) >= 3 and parts[2].isdigit():
-            b = int(parts[2])
-            return f"R_{a}_{b}"
-        return f"R_{a}"
 
-    def extract_level(rule_id: str) -> str:
-        # last token after "_" is the level (מים / ביוב / מים פלדה...)
-        if rule_id is None:
-            return ""
-        parts = [p.strip() for p in str(rule_id).split("_") if p.strip()]
-        if len(parts) < 2:
-            return ""
-        last = parts[-1]
-        # if last is numeric, it’s not a level
-        if re.fullmatch(r"\d+", last):
-            return ""
-        return last
+    # --- Normalize inputs from both raw results and Hebrew-export results ---
+    # If df already came from format_all_checks_for_export(), it may have Hebrew column names.
+    if "plan_file" not in df.columns and "שם הקובץ" in df.columns:
+        df["plan_file"] = df["שם הקובץ"]
 
-    df["check_id"] = df["rule_id"].apply(extract_check_id)
-    df["level"] = df["rule_id"].apply(extract_level)
+    if "rule_name" not in df.columns and "שם הבדיקה" in df.columns:
+        df["rule_name"] = df["שם הבדיקה"]
 
-    # ---------- 2) “רמת בדיקה” = unique levels per check ----------
-    def levels_str(s: pd.Series) -> str:
-        vals = sorted({str(x).strip() for x in s.dropna() if str(x).strip()})
-        return ",".join(vals)
+    if "rule_id" not in df.columns:
+        if "מזהה בדיקה" in df.columns:
+            df["rule_id"] = df["מזהה בדיקה"]
+        elif "מפתח בדיקה" in df.columns:
+            df["rule_id"] = df["מפתח בדיקה"]
 
-    # ---------- 3) “מיקום הבדיקה” = compress key_context ----------
-    def parse_kv(s: str) -> dict:
-        # "plan_cell=R8; kinun_col=water_full" -> {"plan_cell":"R8", "kinun_col":"water_full"}
-        out = {}
-        if not s:
-            return out
-        for part in str(s).split(";"):
-            part = part.strip()
-            if not part:
-                continue
-            if "=" in part:
-                k, v = part.split("=", 1)
-                out[k.strip()] = v.strip()
-            else:
-                out[part] = ""
-        return out
+    if "sheet_name" not in df.columns and "לשונית באקסל" in df.columns:
+        df["sheet_name"] = df["לשונית באקסל"]
 
-    def compress_cell_range(cells):
-        """
-        cells like ["R8","R9","R11"] -> "R8-R11" (min-max per letter group).
-        If multiple letters exist, returns "R8-R12,AA3-AA7" etc.
-        """
-        groups = {}
-        for c in cells:
-            c = str(c).strip()
-            m = re.fullmatch(r"([A-Za-z]+)(\d+)", c)
-            if not m:
-                groups.setdefault("_other_", set()).add(c)
-                continue
-            col, row = m.group(1).upper(), int(m.group(2))
-            groups.setdefault(col, set()).add(row)
+    if "status" not in df.columns and "סטטוס" in df.columns:
+        # reverse-map Hebrew statuses back to English-like tokens used in KPI logic
+        df["status"] = df["סטטוס"].replace({
+            "עבר": "Pass",
+            "נכשל": "Fail",
+            "לא רלוונטי": "Not applicable",
+            "נכשל (ביטחון נמוך)": "Fail",
+        })
 
-        parts = []
-        for col, rows in sorted(groups.items(), key=lambda x: x[0]):
-            if col == "_other_":
-                parts.extend(sorted(rows))
-                continue
-            rows = sorted(rows)
-            if not rows:
-                continue
-            if len(rows) == 1:
-                parts.append(f"{col}{rows[0]}")
-            else:
-                parts.append(f"{col}{rows[0]}-{col}{rows[-1]}")
-        return ",".join(parts)
 
-    def location_from_key_context(series: pd.Series) -> str:
-        # aggregate values per key across all unique key_context strings
-        agg = {}
-        for raw in sorted({str(x).strip() for x in series.dropna() if str(x).strip()}):
-            kv = parse_kv(raw)
-            for k, v in kv.items():
-                if v is None:
-                    continue
-                agg.setdefault(k, set()).add(str(v).strip())
+    # Safety: guarantee columns exist
+    needed = [
+        "plan_file",
+        "rule_id",
+        "rule_name",
+        "sheet_name",
+        "status",
+        "column_name",
+        "row_index",
+        "key_context",
+        "excel_cells",
+    ]
 
-        # Build compact string. Put plan_cell first if exists.
-        out_parts = []
-        if "plan_cell" in agg:
-            cell_range = compress_cell_range(agg["plan_cell"])
-            if cell_range:
-                out_parts.append(f"plan_cell={cell_range}")
+    # If rule_id missing but check_id exists under another common column, recover it
+    if df["rule_id"].isna().all() and "מזהה בדיקה" in df.columns:
+        df["rule_id"] = df["מזהה בדיקה"]
 
-        for k in sorted(agg.keys()):
-            if k == "plan_cell":
-                continue
-            vals = sorted({v for v in agg[k] if v != ""})
-            if vals:
-                out_parts.append(f"{k}=" + ",".join(vals))
-            else:
-                out_parts.append(k)
 
-        return "; ".join(out_parts)
+    for c in needed:
+        if c not in df.columns:
+            df[c] = None
 
-    # ---------- 4) name + details ----------
-    def pick_first_nonempty(series: pd.Series) -> str:
+    # --- Defensive: always have a usable plan_file / file name ---
+    if df["plan_file"].isna().all():
+        df["plan_file"] = ""
+
+    # --- Defensive: always have 'שם קובץ' even in API flows ---
+    if "שם קובץ" not in df.columns or df["שם קובץ"].isna().all():
+        df["שם קובץ"] = df["plan_file"].apply(lambda x: Path(str(x)).stem if str(x).strip() else "")
+
+
+    # Build grouping keys
+    df["check_id"] = df["rule_id"].apply(_extract_check_id)
+    df = df[df["check_id"].astype(str).str.strip().ne("")].copy()
+    df["שם קובץ"] = df["plan_file"].apply(lambda x: Path(str(x)).stem)
+
+    def _pick_first_nonempty(series: pd.Series) -> str:
         for x in series.dropna():
             t = str(x).strip()
-            if t:
+            if t and t.lower() != "nan":
                 return t
         return ""
 
-    def details_from_id(check_id: str) -> str:
-        return RULE_DETAILS.get(check_id, "")
+    def _status_is_fail(v: object) -> bool:
+        return str(v).strip().lower() == "fail"
 
-    # ---------- 5) status rollup ----------
-    def rollup_status(series: pd.Series) -> str:
-        vals = [str(v) for v in series.dropna()]
-        if any(v.lower() == "fail" for v in vals):
+    # Same KPI logic as the CLI printing logic
+    def _kpi_counts(gdf: pd.DataFrame) -> tuple[int, int]:
+        row_idxs = [int(x) for x in gdf["row_index"].dropna().tolist() if str(x).strip().lower() != "nan"]
+        if row_idxs:
+            total = len(set(row_idxs))
+            fail = len(set(
+                int(r) for r, s in zip(gdf["row_index"].tolist(), gdf["status"].tolist())
+                if r is not None and str(r).strip().lower() != "nan" and _status_is_fail(s)
+            ))
+            return fail, total
+
+        total = len(gdf)
+        fail = sum(1 for s in gdf["status"].tolist() if _status_is_fail(s))
+        return fail, total
+
+    def _compact_int_ranges(nums: list[int]) -> str:
+        nums = sorted({int(n) for n in nums if n is not None})
+        if not nums:
+            return ""
+        out = []
+        start = prev = nums[0]
+        for n in nums[1:]:
+            if n == prev + 1:
+                prev = n
+                continue
+            out.append(f"{start}-{prev}" if start != prev else f"{start}")
+            start = prev = n
+        out.append(f"{start}-{prev}" if start != prev else f"{start}")
+        return ",".join(out)
+
+    def _rows_from_group(gdf: pd.DataFrame) -> str:
+        rows: list[int] = []
+
+        # Prefer explicit Excel cell references (Sheet!B12)
+        for v in gdf["excel_cells"].dropna().tolist():
+            cells = v if isinstance(v, list) else None
+            if cells is None:
+                # sometimes stored as a stringified list
+                if isinstance(v, str) and v.strip().startswith("[") and v.strip().endswith("]"):
+                    try:
+                        cells = json.loads(v)
+                    except Exception:
+                        cells = None
+            if not cells:
+                continue
+
+            for cell in cells:
+                if not cell:
+                    continue
+                try:
+                    addr = str(cell).split("!", 1)[1]
+                except Exception:
+                    addr = str(cell)
+                m = re.search(r"[A-Za-z]+(\d+)", addr)
+                if m:
+                    rows.append(int(m.group(1)))
+
+        if rows:
+            return _compact_int_ranges(rows)
+
+        # Fallback: key_context often has "excel_row=<n>"
+        for kc in gdf["key_context"].dropna().astype(str).tolist():
+            for m in re.finditer(r"excel_row\s*=\s*(\d+)", kc):
+                rows.append(int(m.group(1)))
+
+        if rows:
+            return _compact_int_ranges(rows)
+
+        # Last resort: df row numbers (1-based)
+        idxs = [int(x) + 1 for x in gdf["row_index"].dropna().tolist() if str(x).strip().lower() != "nan"]
+        return _compact_int_ranges(idxs)
+
+    def _columns_from_group(gdf: pd.DataFrame) -> str:
+        cols = [str(x).strip() for x in gdf["column_name"].dropna().tolist()]
+        cols = [c for c in cols if c and c.lower() != "nan"]
+        seen = set()
+        out = []
+        for c in cols:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return " / ".join(out)
+    
+    def _location_from_group(gdf: pd.DataFrame) -> str:
+        sheet = _pick_first_nonempty(gdf["sheet_name"])
+        cols = _columns_from_group(gdf)
+        rows = _rows_from_group(gdf)
+
+        return "\n".join([
+            f"לשונית באקסל: {sheet}" if sheet else "לשונית באקסל:",
+            f"עמודות: {cols}" if cols else "עמודות:",
+            f"שורות: {rows}" if rows else "שורות:",
+        ])
+
+
+    def _status_rollup(fail: int, total: int) -> str:
+        if total <= 0 or fail <= 0:
+            return "Pass"
+        if fail >= total:
             return "Fail"
-        if any("review" in v.lower() for v in vals):
-            return "Requires review"
-        return "Pass"
+        return "Partial Fail"
 
-    # ---------- 6) Build summary ----------
-    g = df.groupby("check_id", dropna=False)
-
-    out = pd.DataFrame({
-        "מזהה בדיקה": g.size().index,  # will convert to R1 format below
-        "שם הבדיקה": g["rule_name"].apply(pick_first_nonempty),
-        "פירוט הבדיקה": g.size().index.map(details_from_id),
-        "רמת בדיקה": g["level"].apply(levels_str),
-        "מיקום הבדיקה": g["key_context"].apply(location_from_key_context),
-        "סטטוס": g["status"].apply(rollup_status),
-        "ממצאים": "",
-        "הערות": "",
-        "הערת משתמש": "",
-        "פעולה נדרשת מול התאגיד": "",
-    }).reset_index(drop=True)
-
-    # Convert "R_1" -> "R1" for Summary_Table display
-    out["מזהה בדיקה"] = out["מזהה בדיקה"].astype(str).str.replace("R_", "R", regex=False)
-
-    # Sort by numeric id (R1, R2_3, R10...)
-    def sort_key(x: str):
-        # x like "R2_3" or "R10"
-        x = str(x).replace("R", "", 1)
-        parts = x.split("_")
-        a = int(parts[0]) if parts[0].isdigit() else 10**9
+    def _sort_key(check_id: str) -> tuple[int, int]:
+        s = str(check_id).strip()
+        s = s[2:] if s.startswith("R_") else s
+        parts = s.split("_")
+        a = int(parts[0]) if parts and parts[0].isdigit() else 10**9
         b = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else -1
         return (a, b)
 
-    out = out.sort_values(by="מזהה בדיקה", key=lambda s: s.map(sort_key)).reset_index(drop=True)
-    return out
+    rows_out = []
+    for (file_stem, check_id), gdf in df.groupby(["שם קובץ", "check_id"], dropna=False):
+        fail, total = _kpi_counts(gdf)
+        rows_out.append({
+            "שם קובץ": str(file_stem),
+            "check_id": str(check_id),  # internal for sorting
+            "שם הבדיקה": _pick_first_nonempty(gdf["rule_name"]),
+            "פירוט הבדיקה": RULE_DETAILS.get(str(check_id), ""),
+            "מיקום הבדיקה": _location_from_group(gdf),
+            "ממצאים": f"{check_id}: {fail}/{total} FAIL",
+            "סטטוס": _status_rollup(fail, total),
+            "הערות": "שדה ריק למילוי המשתמש",
+            "הערת משתמש": "שדה ריק למילוי המשתמש",
+            "פעולה נדרשת מול התאגיד": "שדה ריק למילוי המשתמש",
+        })
+
+    out = pd.DataFrame(rows_out)
+
+    # --- Defensive: guarantee file column exists for sorting ---
+    if "שם קובץ" not in out.columns:
+        if "שם הקובץ" in out.columns:
+            out["שם קובץ"] = out["שם הקובץ"]
+        elif "plan_file" in out.columns:
+            out["שם קובץ"] = out["plan_file"]
+        else:
+            out["שם קובץ"] = ""
+
+    # --- Defensive: guarantee check_id exists for sorting ---
+    if "check_id" not in out.columns:
+        if "מזהה בדיקה" in out.columns:
+            out["check_id"] = out["מזהה בדיקה"].astype(str)
+        elif "מפתח בדיקה" in out.columns:
+            out["check_id"] = out["מפתח בדיקה"].astype(str)
+        elif "rule_id" in out.columns:
+            out["check_id"] = out["rule_id"].astype(str)
+        else:
+            out["check_id"] = ""
+
+    out = out.sort_values(
+        by=["שם קובץ", "check_id"],
+        key=lambda s: s.map(_sort_key) if s.name == "check_id" else s,
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+
+
+    out = out.drop(columns=["check_id"], errors="ignore")
+
+    for c in FINAL_COLS:
+        if c not in out.columns:
+            out[c] = ""
+    return out[FINAL_COLS]

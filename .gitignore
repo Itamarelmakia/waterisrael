@@ -23,6 +23,6 @@ test
 *.xlsm
 *.csv
 
-
-
+# MacOS system files
+.DS_Store
 

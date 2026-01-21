@@ -7,7 +7,7 @@ import pandas as pd
 import re
 
 #from llm_client import classify_funding_with_confidence
-from .llm_client import classify_funding_with_confidence
+# from .llm_client import classify_funding_with_confidence
 
 
 #from models import CheckResult, Severity, Status
@@ -724,8 +724,8 @@ def check_014_llm_project_funding_classification(
             )
         ]
 
-    if hasattr(cfg, "llm_enabled") and not cfg.llm_enabled:
-        return []
+    #if hasattr(cfg, "llm_enabled") and not cfg.llm_enabled:
+    #    return []
 
     results: List[CheckResult] = []
 
@@ -774,16 +774,33 @@ def check_014_llm_project_funding_classification(
 
 
             if score < 0.50:
-                try:
-                    prompt = build_llm_prompt(project_name)
-                    model = getattr(cfg, "llm_model", "gpt-4o")
-                    predicted_llm, conf_llm = classify_funding_with_confidence(prompt, model=model)
-                    predicted = canonicalize_label(predicted_llm)
-                    confidence = float(conf_llm)   # ✅ llm confidence
-                    method = f"LLM ({model})"
-                except Exception:
-                    # keep fuzzy predicted and its confidence
-                    method = "LLM לא זמין – fallback להתאמה-טקסטואלית"
+                import os
+
+                llm_enabled = bool(getattr(cfg, "llm_enabled", False))
+                has_key = bool(os.getenv("OPENAI_API_KEY"))
+
+                if llm_enabled and has_key:
+                    try:
+                        from .llm_client import classify_funding_with_confidence  # import רק כשצריך
+
+                        prompt = build_llm_prompt(project_name)
+                        model = getattr(cfg, "llm_model", "gpt-4o")
+                        #predicted_llm, conf_llm = classify_funding_with_confidence(prompt, model=model)
+                        
+                        provider = getattr(cfg, "llm_provider", "gemini")
+                        predicted_llm, conf_llm = classify_funding_with_confidence(prompt, provider=provider, model=model)
+
+
+
+                        predicted = canonicalize_label(predicted_llm)
+                        confidence = float(conf_llm)
+                        method = f"LLM ({model})"
+                    except Exception:
+                        method = "LLM נכשל – fallback להתאמה-טקסטואלית"
+                else:
+                    # אין מפתח / לא מופעל: נשארים על fuzzy
+                    method = "LLM כבוי או חסר OPENAI_API_KEY – NLP בלבד"
+
 
         predicted = canonicalize_label(predicted)
         reported = canonicalize_label(reported)
