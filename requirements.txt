@@ -1,3 +1,12 @@
-pandas
-openpyxl
-openai
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+
+pandas>=2.1
+openpyxl>=3.1
+
+pydantic>=2.5
+python-dotenv>=1.0
+
+google-generativeai>=0.7
+# openai>=1.0

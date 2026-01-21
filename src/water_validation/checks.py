@@ -785,7 +785,13 @@ def check_014_llm_project_funding_classification(
 
                         prompt = build_llm_prompt(project_name)
                         model = getattr(cfg, "llm_model", "gpt-4o")
-                        predicted_llm, conf_llm = classify_funding_with_confidence(prompt, model=model)
+                        #predicted_llm, conf_llm = classify_funding_with_confidence(prompt, model=model)
+                        
+                        provider = getattr(cfg, "llm_provider", "gemini")
+                        predicted_llm, conf_llm = classify_funding_with_confidence(prompt, provider=provider, model=model)
+
+
+
                         predicted = canonicalize_label(predicted_llm)
                         confidence = float(conf_llm)
                         method = f"LLM ({model})"
