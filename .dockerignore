@@ -1,26 +1,47 @@
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-.venv/
-venv/
-env/
+.dockerignore
 
 .git/
+
 .gitignore
 
 .DS_Store
 
+pycache/
+
+**/pycache/
+
+*.pyc
+
+*.pyo
+
+*.pyd
+
+.venv/
+
+venv/
+
+env/
+
+.ipynb_checkpoints/
+
+*.ipynb
+
 outputs/
+
 *.log
 
-# data / large files
 data/
+
 *.xlsx
+
 *.xls
+
 *.csv
 
-# notebooks
-*.ipynb
-.ipynb_checkpoints/
+baseline/
+
+wheels/
+
+*.docx
+
+*.pdf
