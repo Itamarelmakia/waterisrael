@@ -21,6 +21,17 @@ from water_validation.report import (
 app = FastAPI()
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 @app.get("/")
 def root():
     return {"service": "waterisrael-api", "status": "ok"}
@@ -29,6 +40,20 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+from fastapi import Request
+
+@app.get("/debug_headers")
+def debug_headers(request: Request):
+    return {
+        "origin": request.headers.get("origin"),
+        "host": request.headers.get("host"),
+        "headers_present": {
+            "origin": "origin" in request.headers,
+            "referer": "referer" in request.headers,
+        },
+    }
 
 
 def _safe_remove(path: str) -> None:
