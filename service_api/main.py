@@ -17,6 +17,9 @@ from water_validation.report import (
 )
 
 app = FastAPI()
+@app.get("/")
+def root():
+    return {"service": "waterisrael-api", "status": "ok"}
 
 def _as_df(x):
     return x[0] if isinstance(x, tuple) else x
