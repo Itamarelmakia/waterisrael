@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import re
+import math
 
 #from llm_client import classify_funding_with_confidence
 # from .llm_client import classify_funding_with_confidence
@@ -1923,6 +1924,339 @@ def check_020_project_status_planning_report(
     return results
 
 
+def check_024_short_pipe_projects_ratio(
+    report_df: pd.DataFrame,
+    cfg: PlanConfig,
+) -> List[CheckResult]:
+    """
+    R_24 — ratio of expected costs (AE) for projects whose minimum pipe length in column M is < 100.
+
+    - Identify real project rows by project-id column (default "מס' פרויקט")
+    - For each row: extract all numbers in M (supports ":" separated), take MIN.
+      If MIN < 100 => row is in "small pipe" group.
+    - Sum AE ONLY for rows with numeric AE (skip rows where AE is empty/unparseable)
+      - If ALL rows have AE empty => CRITICAL "no info"
+      - If AE has content but NONE numeric => CRITICAL "no numeric"
+    - ratio = sum_small / sum_total; if ratio > 5% => FAIL (CRITICAL)
+    """
+    import re
+    import math
+    from openpyxl.utils import column_index_from_string
+
+    RULE_ID = "R_24"
+    RULE_NAME = "אחוז פרויקטים עם אורך צנרת קטן מ-100 מטרים"
+    SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
+
+    THRESH_M = 100.0
+    THRESH_RATIO = 0.05  # 5%
+
+    cols = list(report_df.columns)
+
+    def _finite_or_none(x: Optional[float]) -> Optional[float]:
+        try:
+            if x is None:
+                return None
+            x = float(x)
+            return x if math.isfinite(x) else None
+        except Exception:
+            return None
+
+    def _safe_int(x: Optional[float]) -> int:
+        x2 = _finite_or_none(x)
+        return int(round(x2)) if x2 is not None else 0
+
+    # Excel -> df column by letter (A=1)
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
+
+    def _is_empty_scalar(v: object) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, (list, tuple, dict, set)):
+            return len(v) == 0
+        if hasattr(v, "shape") and not isinstance(v, (str, bytes)):
+            return False
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
+
+    def _to_number(v: object) -> Optional[float]:
+        if _is_empty_scalar(v):
+            return None
+        try:
+            s = str(v).strip().replace(",", "")
+            return float(s)
+        except Exception:
+            return None
+
+    def _extract_numbers_min(v: object) -> Optional[float]:
+        """
+        Return the minimum numeric value found in the cell.
+        Supports colon-separated patterns like "800:500:200".
+        Falls back to regex for messy text.
+        """
+        if _is_empty_scalar(v):
+            return None
+
+        s = str(v).strip()
+
+        # Fast path: ":" / commas / whitespace separated tokens
+        parts = re.split(r"[:，,;\s]+", s)
+        vals: list[float] = []
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", p):
+                try:
+                    vals.append(float(p))
+                except Exception:
+                    pass
+        if vals:
+            return min(vals)
+
+        # Fallback: find numbers anywhere
+        nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+        if not nums:
+            return None
+        vals = []
+        for t in nums:
+            try:
+                vals.append(float(t))
+            except Exception:
+                continue
+        return min(vals) if vals else None
+
+    # Resolve project id column by normalized header
+    def _norm_col(c: object) -> str:
+        s = str(c) if c is not None else ""
+        s = re.sub(r"\s*Unnamed:.*", "", s)
+        s = re.sub(r"_level_\d+", "", s)
+        s = s.replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    norm_to_orig: dict[str, str] = {}
+    for c in cols:
+        n = _norm_col(c)
+        if n and n not in norm_to_orig:
+            norm_to_orig[n] = c
+
+    id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
+    id_col = norm_to_orig.get(id_norm)
+
+    col_m = _col_by_excel_letter("M")
+    col_ae = _col_by_excel_letter("AE")
+
+    print("R24 resolved:", {"id": id_col, "M": col_m, "AE": col_ae})
+
+    missing = []
+    if id_col is None:
+        missing.append(id_norm)
+    if col_m is None:
+        missing.append("M")
+    if col_ae is None:
+        missing.append("AE")
+
+    if missing:
+        return [
+            CheckResult(
+                rule_id=f"{RULE_ID}_מבנה עמודות",
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name=None,
+                key_context="columns_presence",
+                actual_value=list(report_df.columns),
+                expected_value=[id_norm, "M", "AE"],
+                message=f"Missing required columns: {missing}",
+            )
+        ]
+
+    def _is_real_row(df_i: int) -> bool:
+        v = report_df.at[df_i, id_col]
+        if _is_empty_scalar(v):
+            return False
+        s = str(v).strip()
+        if s in {"-", ""}:
+            return False
+        if s.lower() == "nan":
+            return False
+        return True
+
+    sum_total = 0.0
+    sum_small = 0.0
+
+    any_rows = 0                 # count of real project rows (by id)
+    any_small = 0                # count of rows where min(M) < 100 (regardless of AE)
+
+    ae_present_rows = 0          # AE has any content (non-empty)
+    ae_numeric_rows = 0          # AE parsed to finite number
+    ae_skipped_total = 0         # rows skipped from denominator
+    ae_skipped_small = 0         # rows skipped from numerator (in small group)
+
+    for i in range(len(report_df)):
+        if not _is_real_row(i):
+            continue
+        any_rows += 1
+
+        raw_m = report_df.at[i, col_m]
+        m_min = _extract_numbers_min(raw_m)
+        is_small = (m_min is not None) and (m_min < THRESH_M)
+        if is_small:
+            any_small += 1
+
+        raw_ae = report_df.at[i, col_ae]
+        if not _is_empty_scalar(raw_ae):
+            ae_present_rows += 1
+
+        ae_num = _to_number(raw_ae)
+        if ae_num is None or (not math.isfinite(ae_num)):
+            ae_skipped_total += 1
+            if is_small:
+                ae_skipped_small += 1
+            continue
+
+        ae_numeric_rows += 1
+        sum_total += ae_num
+        if is_small:
+            sum_small += ae_num
+
+    if any_rows == 0:
+        return [
+            CheckResult(
+                rule_id=RULE_ID,
+                rule_name=RULE_NAME,
+                severity=Severity.WARNING,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name="M",
+                key_context="no_project_rows",
+                actual_value="לא נמצאו שורות פרויקט",
+                expected_value="נדרש לפחות פרויקט אחד",
+                confidence=1.0,
+                method="Summary",
+                message="נכשל: לא נמצאו שורות פרויקט לביצוע בדיקה",
+            )
+        ]
+
+    # ALARM: all AE cells empty across all real project rows
+    if ae_present_rows == 0:
+        return [
+            CheckResult(
+                rule_id=RULE_ID,
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name="AE",
+                key_context="ae_no_info_all_rows",
+                actual_value=f"AE ריק בכל שורות הפרויקט (סה\"כ פרויקטים: {any_rows})",
+                expected_value="נדרש לפחות אומדן אחד בעמודה AE",
+                confidence=1.0,
+                method="Summary",
+                message="שגיאה קריטית: אין מידע בעמודה AE (כל הערכים ריקים), לא ניתן לחשב יחס.",
+            )
+        ]
+
+    # ALARM: AE has content but none numeric/finite
+    if ae_numeric_rows == 0:
+        return [
+            CheckResult(
+                rule_id=RULE_ID,
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name="AE",
+                key_context="ae_unparseable_all_rows",
+                actual_value=f"AE לא מספרי בכל שורות הפרויקט (סה\"כ פרויקטים: {any_rows}, לא ריקים: {ae_present_rows})",
+                expected_value="נדרש אומדן מספרי בעמודה AE",
+                confidence=1.0,
+                method="Summary",
+                message="שגיאה קריטית: בעמודה AE אין אף ערך מספרי תקין, לא ניתן לחשב יחס.",
+            )
+        ]
+
+    # After skipping missing AE rows, still must have a positive denominator
+    if (not math.isfinite(sum_total)) or (sum_total <= 0):
+        return [
+            CheckResult(
+                rule_id=RULE_ID,
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name="AE",
+                key_context="total_estimate_zero_after_skips",
+                actual_value=f"סה\"כ אומדנים (רק ערכים תקינים)={_safe_int(sum_total)} | דילוגים={ae_skipped_total}",
+                expected_value="סה\"כ אומדנים > 0",
+                confidence=1.0,
+                method="Summary",
+                message="נכשל: לאחר דילוג על פרויקטים ללא אומדן AE תקין, סה\"כ האומדנים הוא 0 ולכן לא ניתן לחשב יחס.",
+            )
+        ]
+
+    ratio = sum_small / sum_total
+    pct = ratio * 100.0
+
+    note = ""
+    if ae_skipped_total > 0:
+        note = f" | דילוג על {ae_skipped_total} פרויקטים ללא אומדן AE מספרי תקין"
+        if ae_skipped_small > 0:
+            note += f" (מתוכם {ae_skipped_small} בקבוצת <100)"
+
+    ok = ratio <= THRESH_RATIO
+    status = Status.PASS_ if ok else Status.FAIL
+    sev = Severity.INFO if ok else Severity.CRITICAL
+
+    actual_str = f"{pct:.2f}% (סכום קטן מ-100: {_safe_int(sum_small)} מתוך {_safe_int(sum_total)}){note}"
+    expected_str = "עד 5%"
+
+    msg = (
+        f"עבר: אחוז הפרויקטים עם אורך צנרת קטן מ-100 מטרים הוא {pct:.2f}%{note}"
+        if ok
+        else f"שגיאה: אחוז הפרויקטים עם אורך צנרת קטן מ-100 מטרים הוא {pct:.2f}% (> 5%){note}"
+    )
+
+    return [
+        CheckResult(
+            rule_id=RULE_ID,
+            rule_name=RULE_NAME,
+            severity=sev,
+            sheet_name=SHEET,
+            status=status,
+            row_index=None,
+            column_name="אורך צנרת (M) + אומדן (AE)",
+            key_context=(
+                f"small<100_count={any_small} | total_projects={any_rows} | "
+                f"ae_numeric_rows={ae_numeric_rows} | skipped_ae_rows={ae_skipped_total}"
+            ),
+            actual_value=actual_str,
+            expected_value=expected_str,
+            confidence=1.0,
+            method="SummaryRatio",
+            excel_cells=None,
+            message=msg,
+        )
+    ]
+
 
 # Regex catches things like:
 # "רחוב שכונת" / "רחוב שכונה" / "רחוב שכונת ..." where there's no real descriptor
@@ -1950,4 +2284,6 @@ __all__ = [
     "check_018_facility_rehab_upgrade",
     "check_019_total_planned_cost_per_project",
     "check_020_project_status_planning_report",
+    "check_024_short_pipe_projects_ratio",
+
 ]

@@ -36,6 +36,7 @@ from .checks import (
     check_018_facility_rehab_upgrade,
     check_019_total_planned_cost_per_project,
     check_020_project_status_planning_report,
+    check_024_short_pipe_projects_ratio,
     load_kinun_store,
 )
 
@@ -157,6 +158,8 @@ def run_summary_sheet_checks(
     _run_rule("R_20", lambda: check_020_project_status_planning_report(report_df, cfg))
 
     _run_rule("R_14", lambda: check_014_llm_project_funding_classification(report_df, cfg))
+    _run_rule("R_24", lambda: check_024_short_pipe_projects_ratio(report_df, cfg))
+
     # ---- End rules ----
 
 
