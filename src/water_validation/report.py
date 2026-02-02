@@ -420,6 +420,7 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
     """
 
     FINAL_COLS = [
+        "רשות מקומית",
         "שם קובץ",
         "שם הבדיקה",
         "פירוט הבדיקה",
@@ -494,6 +495,12 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
     if "שם קובץ" not in df.columns or df["שם קובץ"].isna().all():
         df["שם קובץ"] = df["plan_file"].apply(lambda x: Path(str(x)).stem if str(x).strip() else "")
 
+    # --- Defensive: always have 'רשות מקומית' ---
+    if "רשות מקומית" not in df.columns:
+        if "utility_name" in df.columns:
+            df["רשות מקומית"] = df["utility_name"]
+        else:
+            df["רשות מקומית"] = ""
 
     # Build grouping keys
     df["check_id"] = df["rule_id"].apply(_extract_check_id)
@@ -625,6 +632,7 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
     for (file_stem, check_id), gdf in df.groupby(["שם קובץ", "check_id"], dropna=False):
         fail, total = _kpi_counts(gdf)
         rows_out.append({
+            "רשות מקומית": _pick_first_nonempty(gdf["רשות מקומית"]),
             "שם קובץ": str(file_stem),
             "check_id": str(check_id),  # internal for sorting
             "שם הבדיקה": _pick_first_nonempty(gdf["rule_name"]),
