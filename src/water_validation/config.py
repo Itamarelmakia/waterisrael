@@ -74,7 +74,7 @@ class InputDiscoveryConfig:
     File discovery defaults for 'all files in same folder'.
     Adjust patterns to your real filenames.
     """
-    plan_glob: str = "תכנית השקעות*.xlsx"
+    plan_glob: str = "*תכנית השקעות*.xlsx"
     kinun_glob: str = "ערכי כינון*.xlsx"
 
 

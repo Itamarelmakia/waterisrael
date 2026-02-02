@@ -2620,6 +2620,366 @@ def check_020_project_status_planning_report(
     return results
 
 
+# =============================================================================
+# R_23 — בדיקת מחיר צנרת - לפי כלל אצבע
+# =============================================================================
+
+# mm → inch conversion table (known-good mappings only)
+_MM_TO_INCH: Dict[int, int] = {
+    100: 4, 160: 6, 200: 8, 250: 10, 315: 12,
+    355: 14, 400: 16, 450: 18, 500: 20, 630: 24,
+    710: 28, 800: 32, 1000: 40,
+    # 300→36 excluded: suspicious mapping (300mm ≈ 12" which already maps from 315mm)
+}
+
+# Values at or below this threshold are treated as inches; above as mm
+_INCH_THRESHOLD = 50
+
+
+def check_023_pipe_cost_rule_of_thumb(
+    report_df: pd.DataFrame,
+    cfg: PlanConfig,
+) -> List[CheckResult]:
+    """
+    R_23 — בדיקת מחיר צנרת לפי כלל אצבע
+
+    Applies only to rows where column G == "קווי מים".
+    Compares a rule-of-thumb per-meter cost (based on pipe diameter)
+    against the reported contractor cost per meter (AE*1000 / M).
+
+    Formula:
+        estimated_calc    = diameter_inches * 1.2 * 150
+        estimated_contrac = (AE * 1000) / M
+
+    Fail if:
+        estimated_calc < estimated_contrac  OR
+        estimated_contrac > 1.5 * estimated_calc
+    """
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    RULE_ID = "R_23"
+    RULE_NAME = "בדיקת מחיר צנרת - לפי כלל אצבע"
+    SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
+
+    cols = list(report_df.columns)
+
+    # ---- local helpers (same pattern as R19/R24) ----
+
+    def _is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
+
+    def _to_number(v: object) -> Optional[float]:
+        if _is_empty(v):
+            return None
+        try:
+            s = str(v).strip().replace(",", "")
+            return float(s)
+        except Exception:
+            return None
+
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
+
+    def _norm_col(c: object) -> str:
+        s = str(c) if c is not None else ""
+        s = re.sub(r"\s*Unnamed:.*", "", s)
+        s = re.sub(r"_level_\d+", "", s)
+        s = s.replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # ---- resolve columns ----
+    col_g = _col_by_excel_letter("G")   # קוד הנדסי
+    col_l = _col_by_excel_letter("L")   # קוטר
+    col_m = _col_by_excel_letter("M")   # אורך צנרת
+    col_ae = _col_by_excel_letter("AE") # אומדן פרויקט
+
+    missing = []
+    if col_g is None:
+        missing.append("G")
+    if col_l is None:
+        missing.append("L")
+    if col_m is None:
+        missing.append("M")
+    if col_ae is None:
+        missing.append("AE")
+
+    if missing:
+        return [
+            CheckResult(
+                rule_id=f"{RULE_ID}_מבנה עמודות",
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name=None,
+                key_context="columns_presence",
+                actual_value=list(report_df.columns),
+                expected_value=["G", "L", "M", "AE"],
+                message=f"Missing required columns: {missing}",
+            )
+        ]
+
+    # ---- project-id for real-row detection ----
+    norm_to_orig: dict = {}
+    for c in cols:
+        n = _norm_col(c)
+        if n and n not in norm_to_orig:
+            norm_to_orig[n] = c
+
+    id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
+    id_col = norm_to_orig.get(id_norm)
+
+    def _is_real_row(df_i: int) -> bool:
+        if id_col is None:
+            return True
+        v = report_df.at[df_i, id_col]
+        if _is_empty(v):
+            return False
+        s = str(v).strip()
+        return s not in {"-", ""} and s.lower() != "nan"
+
+    # ---- excel cell refs ----
+    col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
+    header_row = getattr(cfg, "report_header_row", 6)
+    excel_row_offset = header_row + 2
+
+    def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
+        letter = col_to_excel_letter.get(col_name)
+        if not letter:
+            return None
+        return f"{SHEET}!{letter}{int(df_i + excel_row_offset)}"
+
+    # ---- diameter conversion helper ----
+    def _diameter_to_inch(raw_val: str) -> Tuple[Optional[float], str]:
+        """
+        Convert raw diameter value to inches.
+        Returns (inch_value, note).
+        inch_value is None if conversion fails.
+        """
+        num = _to_number(raw_val)
+        if num is None:
+            return None, "ערך קוטר לא מספרי"
+
+        if num <= 0:
+            return None, "קוטר <= 0"
+
+        if num <= _INCH_THRESHOLD:
+            # Treat as inches directly
+            return num, ""
+
+        # Treat as mm — look up conversion
+        mm_int = int(round(num))
+        inch = _MM_TO_INCH.get(mm_int)
+        if inch is not None:
+            return float(inch), f"המרה: {mm_int}mm → {inch}\""
+
+        # Try nearest mm key (tolerance ±5mm)
+        for mm_key, inch_val in _MM_TO_INCH.items():
+            if abs(mm_key - num) <= 5:
+                return float(inch_val), f"המרה (קירוב): {num}mm ≈ {mm_key}mm → {inch_val}\""
+
+        return None, f"ערך {mm_int}mm לא נמצא בטבלת ההמרה"
+
+    # ---- main iteration ----
+    results: List[CheckResult] = []
+
+    for i in range(len(report_df)):
+        if not _is_real_row(i):
+            continue
+
+        excel_row = int(i + excel_row_offset)
+        pid = str(report_df.at[i, id_col]).strip() if id_col else f"row_{i}"
+
+        # 1. Filter: only "קווי מים" in column G
+        raw_g = str(report_df.at[i, col_g] or "").strip()
+        g_norm = normalize_text(raw_g)
+        if "קווי מים" not in g_norm:
+            continue
+
+        # 2. Column L empty → skip
+        raw_l = report_df.at[i, col_l]
+        if _is_empty(raw_l):
+            continue
+
+        raw_l_str = str(raw_l).strip()
+
+        # 3. Multi-value (contains ":") → skip
+        if ":" in raw_l_str:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=raw_l_str,
+                    expected_value="ערך קוטר בודד",
+                    message=f"דילוג: קוטר מכיל מגוון ערכים ({raw_l_str})",
+                    excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
+                )
+            )
+            continue
+
+        # 4. Convert diameter to inches
+        diameter_inch, conv_note = _diameter_to_inch(raw_l_str)
+        if diameter_inch is None:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=raw_l_str,
+                    expected_value="קוטר תקין באינצ׳ או מ״מ",
+                    message=f"דילוג: {conv_note}",
+                    excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
+                )
+            )
+            continue
+
+        # 5. Column M (pipe length) must be > 0
+        raw_m = report_df.at[i, col_m]
+        m_val = _to_number(raw_m)
+        if m_val is None or m_val <= 0:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="M",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=str(raw_m),
+                    expected_value="אורך צנרת > 0",
+                    message="דילוג: אורך צנרת חסר או 0 (מניעת חילוק באפס)",
+                    excel_cells=[_cell_ref(i, col_m)] if _cell_ref(i, col_m) else None,
+                )
+            )
+            continue
+
+        # 6. Column AE (estimate) must be numeric
+        raw_ae = report_df.at[i, col_ae]
+        ae_val = _to_number(raw_ae)
+        if ae_val is None:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="AE",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=str(raw_ae),
+                    expected_value="אומדן פרויקט מספרי",
+                    message="דילוג: אומדן פרויקט חסר או לא מספרי",
+                    excel_cells=[_cell_ref(i, col_ae)] if _cell_ref(i, col_ae) else None,
+                )
+            )
+            continue
+
+        # 7. Calculate
+        estimated_calc = diameter_inch * 1.2 * 150
+        estimated_contractor = (ae_val * 1000) / m_val
+
+        calc_round = round(estimated_calc, 1)
+        contr_round = round(estimated_contractor, 1)
+
+        # 8. Deviation check — pass range: [calc, 1.5*calc]
+        #    fail if contractor < calc (too low) or contractor > 1.5*calc (too high)
+        upper_bound = 1.5 * estimated_calc
+        is_fail = (estimated_contractor < estimated_calc) or (estimated_contractor > upper_bound)
+
+        conv_suffix = f" | {conv_note}" if conv_note else ""
+
+        refs = []
+        for c in [col_l, col_m, col_ae]:
+            r = _cell_ref(i, c)
+            if r:
+                refs.append(r)
+
+        expected_range = f"{calc_round}-{round(upper_bound, 1)} ₪ (כלל אצבע: {calc_round} ₪)"
+
+        if is_fail:
+            if estimated_contractor < estimated_calc:
+                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) נמוכה מכלל אצבע ({calc_round} ₪)"
+            else:
+                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) חורגת מ-1.5× כלל אצבע ({round(upper_bound, 1)} ₪)"
+
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="AE",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"עלות קבלנית למטר: {contr_round} ₪",
+                    expected_value=expected_range,
+                    confidence=1.0,
+                    method="RuleOfThumb",
+                    message=(
+                        f"חריגה: {fail_reason} | "
+                        f"קוטר={diameter_inch}\" | AE={ae_val} | M={m_val}{conv_suffix}"
+                    ),
+                    excel_cells=refs or None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.PASS_,
+                    row_index=int(i),
+                    column_name="AE",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"עלות קבלנית למטר: {contr_round} ₪",
+                    expected_value=expected_range,
+                    confidence=1.0,
+                    method="RuleOfThumb",
+                    message=(
+                        f"תקין: עלות קבלנית למטר ({contr_round} ₪) "
+                        f"בטווח {calc_round}-{round(upper_bound, 1)} ₪ | "
+                        f"קוטר={diameter_inch}\"{conv_suffix}"
+                    ),
+                    excel_cells=refs or None,
+                )
+            )
+
+    return results
+
+
 def check_024_short_pipe_projects_ratio(
     report_df: pd.DataFrame,
     cfg: PlanConfig,

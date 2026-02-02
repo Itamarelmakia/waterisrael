@@ -45,15 +45,32 @@ def discover_inputs(input_dir: str | Path, disco: InputDiscoveryConfig) -> Tuple
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
+    # Build plan glob variants: handle both תכנית and תוכנית spellings
+    plan_globs = [disco.plan_glob]
+    if "תכנית" in disco.plan_glob:
+        plan_globs.append(disco.plan_glob.replace("תכנית", "תוכנית"))
+
     # 1) search in input_dir
-    plan_files = sorted(input_dir.glob(disco.plan_glob))
+    plan_files_set: set[Path] = set()
+    for pg in plan_globs:
+        plan_files_set.update(input_dir.glob(pg))
+    # Exclude temp files (e.g. ~$...)
+    plan_files = sorted(
+        [p for p in plan_files_set if not p.name.startswith("~$")],
+        key=lambda p: p.name,
+    )
     kinun_candidates = sorted(input_dir.glob(disco.kinun_glob))
 
     # 2) fallback: search in input_dir/data
     data_dir = input_dir / "data"
     if (not plan_files or not kinun_candidates) and data_dir.exists():
         if not plan_files:
-            plan_files = sorted(data_dir.glob(disco.plan_glob))
+            for pg in plan_globs:
+                plan_files_set.update(data_dir.glob(pg))
+            plan_files = sorted(
+                [p for p in plan_files_set if not p.name.startswith("~$")],
+                key=lambda p: p.name,
+            )
         if not kinun_candidates:
             kinun_candidates = sorted(data_dir.glob(disco.kinun_glob))
 

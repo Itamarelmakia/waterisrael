@@ -81,13 +81,23 @@ def parse_ratio(value: Any) -> Optional[float]:
 
 def extract_utility_from_plan_filename(plan_file: str | Path) -> str:
     stem = normalize_text(Path(plan_file).stem)
+
+    # Strategy 1: legacy format — contains "תאגיד"
     m = re.search(r"\bתאגיד\b\s*(.+)$", stem)
-    if not m:
-        raise ValueError(f"Cannot extract utility from filename (missing 'תאגיד'): {stem}")
-    utility = normalize_text(m.group(1))
-    if not utility:
-        raise ValueError(f"Cannot extract utility from filename (empty after 'תאגיד'): {stem}")
-    return utility
+    if m:
+        utility = normalize_text(m.group(1))
+        if utility:
+            return utility
+
+    # Strategy 2: new format — split by "_", find year (2024-2027), city is segment before year
+    parts = [p.strip() for p in stem.split("_") if p.strip()]
+    for i, part in enumerate(parts):
+        if re.fullmatch(r"20(?:2[4-9]|3[0-7])", part) and i > 0:
+            city = normalize_text(parts[i - 1])
+            if city:
+                return city
+
+    raise ValueError(f"Cannot extract utility/city from filename: {stem}")
 
 
 def excel_row_to_df_index(excel_row_1_based: int, cfg: PlanConfig) -> int:
