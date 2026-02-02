@@ -4,8 +4,8 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app/src
 
-# LLM config (Gemini)
-ENV LLM_ENABLED=false
+# LLM config (Gemini) — set GEMINI_API_KEY in deployment env
+ENV LLM_ENABLED=true
 ENV LLM_PROVIDER=gemini
 ENV LLM_MODEL=gemini-1.5-flash
 

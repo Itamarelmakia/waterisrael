@@ -56,6 +56,25 @@ def debug_headers(request: Request):
     }
 
 
+@app.get("/config")
+def show_config():
+    """Show current LLM configuration (no secrets)."""
+    cfg = _build_config()
+    has_gemini_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    return {
+        "llm_enabled": cfg.llm_enabled,
+        "llm_provider": cfg.llm_provider,
+        "llm_model": cfg.llm_model,
+        "has_gemini_key": has_gemini_key,
+        "has_openai_key": has_openai_key,
+        "llm_ready": cfg.llm_enabled and (
+            (cfg.llm_provider == "gemini" and has_gemini_key) or
+            (cfg.llm_provider == "openai" and has_openai_key)
+        ),
+    }
+
+
 def _safe_remove(path: str) -> None:
     try:
         os.remove(path)
@@ -88,8 +107,27 @@ def _save_upload_to_tmp(file: UploadFile) -> str:
     return in_path
 
 
-def _run_validation(in_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+def _build_config() -> PlanConfig:
+    """Build PlanConfig from environment variables."""
     cfg = PlanConfig()
+
+    # LLM configuration from environment
+    llm_enabled_env = os.getenv("LLM_ENABLED", "true").strip().lower()
+    cfg.llm_enabled = llm_enabled_env in ("true", "1", "yes")
+
+    llm_provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+    if llm_provider:
+        cfg.llm_provider = llm_provider
+
+    llm_model = os.getenv("LLM_MODEL", "").strip()
+    if llm_model:
+        cfg.llm_model = llm_model
+
+    return cfg
+
+
+def _run_validation(in_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    cfg = _build_config()
 
     all_checks_df = run_summary_sheet_checks(
         plan_file=in_path,
