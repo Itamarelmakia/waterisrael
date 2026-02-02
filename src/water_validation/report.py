@@ -681,3 +681,179 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
         if c not in out.columns:
             out[c] = ""
     return out[FINAL_COLS]
+
+
+# ---------------------------------------------------------------------------
+# LLM Executive Summary
+# ---------------------------------------------------------------------------
+
+def _extract_year_from_filename(plan_file: str) -> str:
+    """Extract year (e.g. '2026') from plan filename."""
+    parts = str(plan_file).replace("\\", "/").split("/")[-1].split("_")
+    for p in parts:
+        p = p.strip()
+        if re.fullmatch(r"20(?:2[4-9]|3[0-7])", p):
+            return p
+    # fallback: find any 4-digit year in filename
+    m = re.search(r"(20[2-3]\d)", str(plan_file))
+    return m.group(1) if m else ""
+
+
+def build_executive_summary_prompt(
+    file_checks_df: pd.DataFrame,
+    utility_name: str,
+    plan_file: str,
+) -> str:
+    """
+    Build a Hebrew LLM prompt for generating an executive summary
+    from the validation results of a single file.
+    """
+    df = file_checks_df.copy()
+
+    # --- Counts ---
+    fail_mask = df["status"].isin(["Fail", "נכשל"])
+    pass_mask = df["status"].isin(["Pass", "עבר"])
+    info_mask = df["status"].isin(["לא ידוע", "Info", "לא רלוונטי", "Not applicable"])
+
+    total = len(df)
+    fail_count = int(fail_mask.sum())
+    pass_count = int(pass_mask.sum())
+    info_count = int(info_mask.sum())
+
+    # --- Year ---
+    year = _extract_year_from_filename(plan_file)
+    year_range = f"{year}-{int(year)+4}" if year else "לא ידוע"
+
+    # --- Unique checks and rows ---
+    unique_rules = df["rule_id"].nunique() if "rule_id" in df.columns else 0
+    unique_rows = 0
+    if "row_index" in df.columns:
+        row_vals = df["row_index"].dropna()
+        row_vals = [int(float(x)) for x in row_vals if str(x).strip().lower() not in ("", "nan", "none")]
+        unique_rows = len(set(row_vals))
+
+    # --- R_5 row (סה"כ נתוני תוכנית השקעה) ---
+    r5_info = ""
+    r5_mask = df["rule_id"].str.startswith("R_5") if "rule_id" in df.columns else pd.Series([False]*len(df))
+    if r5_mask.any():
+        r5_rows = df[r5_mask]
+        r5_statuses = r5_rows["status"].tolist()
+        r5_fail = sum(1 for s in r5_statuses if str(s).strip().lower() in ("fail", "נכשל"))
+        r5_total = len(r5_statuses)
+        r5_info = f"R_5 (סה\"כ נתוני תוכנית השקעה): {r5_fail}/{r5_total} כשלונות"
+        # Add actual values if available
+        if "actual_value" in df.columns:
+            vals = [str(v).strip() for v in r5_rows["actual_value"].dropna().tolist() if str(v).strip() not in ("", "nan")]
+            if vals:
+                r5_info += f"\n  ערכים: {', '.join(vals[:5])}"
+
+    # --- R_24 (short pipe projects) ---
+    r24_info = ""
+    r24_mask = df["rule_id"].str.startswith("R_24") if "rule_id" in df.columns else pd.Series([False]*len(df))
+    if r24_mask.any():
+        r24_rows = df[r24_mask]
+        r24_fail = sum(1 for s in r24_rows["status"].tolist() if str(s).strip().lower() in ("fail", "נכשל"))
+        r24_total = len(r24_rows)
+        r24_info = f"R_24 (פרויקטים קטנים - אורך צנרת < 100): {r24_fail}/{r24_total} כשלונות"
+        if "message" in df.columns:
+            msgs = [str(m).strip() for m in r24_rows["message"].dropna().tolist() if str(m).strip() not in ("", "nan")]
+            if msgs:
+                r24_info += f"\n  {msgs[0][:200]}"
+
+    # --- Failed rules breakdown ---
+    failed_rules_text = ""
+    if fail_count > 0:
+        fail_df = df[fail_mask]
+        if "rule_id" in fail_df.columns and "rule_name" in fail_df.columns:
+            rule_counts = (
+                fail_df.groupby(["rule_id", "rule_name"])
+                .size()
+                .reset_index(name="count")
+                .sort_values("count", ascending=False)
+            )
+            lines = []
+            for _, row in rule_counts.iterrows():
+                check_id = _extract_check_id(str(row["rule_id"]))
+                detail = RULE_DETAILS.get(check_id, "")
+                lines.append(f"- {check_id} ({row['rule_name']}): {row['count']} כשלונות")
+                if detail:
+                    lines.append(f"  פירוט: {detail[:150]}")
+            failed_rules_text = "\n".join(lines)
+
+    # --- Build prompt ---
+    prompt_lines = [
+        "אתה בודק מקצועי של תוכניות השקעה של תאגידי מים וביוב בישראל.",
+        "כתוב תקציר מנהלים בעברית על סמך תוצאות הבדיקה הבאות.",
+        "",
+        f"שם תאגיד: {utility_name}",
+        f"שם קובץ: {Path(plan_file).stem}",
+        f"לגבי שנים: {year_range}",
+        "",
+        "נתוני הבדיקה:",
+        f"- סה\"כ בדיקות: {total} ({unique_rows} שורות × {unique_rules} סוגי בדיקות)",
+        f"- עברו: {pass_count}",
+        f"- נכשלו: {fail_count}",
+        f"- דורשות בירור / לא רלוונטי: {info_count}",
+        "",
+    ]
+
+    if r5_info:
+        prompt_lines.append("ערכים שהוגדרו \"סה\"כ נתוני תוכנית השקעה\" (שורה 5 בנספח הבדיקות):")
+        prompt_lines.append(r5_info)
+        prompt_lines.append("")
+
+    if r24_info:
+        prompt_lines.append("התייחסות לפרויקטים קטנים - בדיקת אורך (שורה 25):")
+        prompt_lines.append(r24_info)
+        prompt_lines.append("")
+
+    if failed_rules_text:
+        prompt_lines.append("פירוט בדיקות שנכשלו:")
+        prompt_lines.append(failed_rules_text)
+        prompt_lines.append("")
+
+    prompt_lines.extend([
+        "התקציר צריך לכלול:",
+        "1. שם תאגיד, ותאריך הגשה, לגבי שנים",
+        "2. מספר בדיקות שנעשו (שורות × בדיקות)",
+        "3. מספר בדיקות שעברו, נכשלו, או דורשות בירור",
+        "4. ציון ערכים שהוגדרו \"סה\"כ נתוני תוכנית השקעה\"",
+        "5. התייחסות לפרויקטים קטנים - בדיקת אורך",
+        "6. דפוסים שחוזרים על עצמם (לדוגמה ריבוי חריגות בקטרים או שדות ריקים)",
+        "7. המלצות מקצועיות להמשך הטיפול בתאגיד",
+        "",
+        "כתוב בצורה מקצועית ותמציתית. אל תמציא נתונים - השתמש רק במידע שסופק.",
+    ])
+
+    return "\n".join(prompt_lines)
+
+
+def generate_executive_summaries(
+    all_checks_df: pd.DataFrame,
+    cfg,
+) -> dict:
+    """
+    Generate LLM executive summary per file.
+    Returns: {utility_name: summary_text}
+    """
+    from .llm_client import generate_text, LLMQuotaError
+
+    if not cfg.llm_enabled:
+        return {}
+
+    summaries = {}
+    for (utility, plan_file), gdf in all_checks_df.groupby(["utility_name", "plan_file"]):
+        prompt = build_executive_summary_prompt(gdf, str(utility), str(plan_file))
+        try:
+            text = generate_text(
+                prompt,
+                provider=cfg.llm_provider,
+                model=cfg.llm_model,
+            )
+            summaries[str(utility)] = text
+        except LLMQuotaError:
+            summaries[str(utility)] = "שגיאה: חריגת מכסת LLM. לא ניתן ליצור תקציר."
+        except Exception as e:
+            summaries[str(utility)] = f"שגיאה ביצירת תקציר: {e}"
+
+    return summaries

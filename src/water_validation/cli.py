@@ -18,7 +18,7 @@ from .excel_io import discover_inputs
 from .runner import run_summary_sheet_checks
 
 #from report import build_executive_summary, build_summary_table, format_all_checks_for_export
-from .report import build_executive_summary, build_summary_table, format_all_checks_for_export
+from .report import build_executive_summary, build_summary_table, format_all_checks_for_export, generate_executive_summaries
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]  # .../waterisrael
@@ -135,6 +135,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 
+    # Generate LLM executive summaries per file
+    exec_summaries = generate_executive_summaries(all_checks, cfg)
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_table.to_excel(writer, sheet_name="Summary_Table", index=False)
         headline.to_excel(writer, sheet_name="Executive_Summary", index=False)
@@ -143,6 +146,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         top_rules.to_excel(writer, sheet_name="Top_Failing_Rules", index=False)
         all_checks_export.to_excel(writer, sheet_name="All_Checks", index=False)
 
+        for utility_name, summary_text in exec_summaries.items():
+            sheet_name = f"executive_{utility_name}"[:31]  # Excel 31-char limit
+            pd.DataFrame({"תקציר מנהלים": [summary_text]}).to_excel(
+                writer, sheet_name=sheet_name, index=False,
+            )
+
 
     # אחרי שהקובץ נשמר וסגור:
     #from excel_io import apply_red_highlights
@@ -150,6 +159,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     apply_red_highlights(str(output_path), all_checks_export)
 
+    if exec_summaries:
+        print(f"Executive summaries generated for: {', '.join(exec_summaries.keys())}")
     print(f"Validation complete. Output saved to: {output_path.resolve()}")
     return 0
 

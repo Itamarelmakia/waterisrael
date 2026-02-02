@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from "react";
-import { Upload, FileSpreadsheet, X, Loader2, ChevronDown, ChevronLeft, Download } from "lucide-react";
+import { Upload, FileSpreadsheet, X, Loader2, ChevronDown, ChevronLeft, Download, FileText } from "lucide-react";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "https://waterisrael-api.onrender.com";
 
@@ -45,6 +45,25 @@ async function validateExcel(file) {
   return rows.map(normalizeRow);
 }
 
+async function fetchExecutiveSummary(file) {
+  const formData = new FormData();
+  formData.append("file", file, file.name || "upload.xlsx");
+
+  const res = await fetch(`${API_BASE}/executive_summary`, { method: "POST", body: formData });
+  const text = await res.text();
+
+  if (!res.ok) throw new Error(`API /executive_summary failed: ${res.status} ${text}`);
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new Error(`Non-JSON response from /executive_summary: ${text}`);
+  }
+
+  return json?.summaries ?? {};
+}
+
 async function downloadValidationExcel(file) {
   const formData = new FormData();
   formData.append("file", file, file.name || "upload.xlsx");
@@ -73,6 +92,9 @@ export default function App() {
   const [isValidating, setIsValidating] = useState(false);
   const [hasResults, setHasResults] = useState(false);
   const [expandedRows, setExpandedRows] = useState(new Set());
+  const [execSummaries, setExecSummaries] = useState(null);
+  const [isLoadingSummary, setIsLoadingSummary] = useState(false);
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
 
   const fileInputRef = useRef(null);
 
@@ -88,7 +110,24 @@ export default function App() {
     setValidationResults([]);
     setHasResults(false);
     setExpandedRows(new Set());
+    setExecSummaries(null);
+    setShowSummaryModal(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const handleExecSummary = async () => {
+    if (!selectedFile) return;
+    setIsLoadingSummary(true);
+    try {
+      const summaries = await fetchExecutiveSummary(selectedFile);
+      setExecSummaries(summaries);
+      setShowSummaryModal(true);
+    } catch (err) {
+      setExecSummaries({ "שגיאה": String(err?.message || err) });
+      setShowSummaryModal(true);
+    } finally {
+      setIsLoadingSummary(false);
+    }
   };
 
   const toggleRowExpansion = (index) => {
@@ -226,6 +265,18 @@ export default function App() {
               הורד Excel
             </span>
           </button>
+
+          <button
+            onClick={handleExecSummary}
+            disabled={!selectedFile || isValidating || isLoadingSummary}
+            style={{ ...styles.secondaryBtn, opacity: !selectedFile || isValidating || isLoadingSummary ? 0.55 : 1 }}
+            title="תקציר מנהלים"
+          >
+            <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+              {isLoadingSummary ? <Loader2 size={18} className="spin" /> : <FileText size={18} />}
+              {isLoadingSummary ? "יוצר תקציר..." : "תקציר מנהלים"}
+            </span>
+          </button>
         </div>
 
         {hasResults && (
@@ -309,6 +360,31 @@ export default function App() {
                   })}
                 </tbody>
               </table>
+            </div>
+          </div>
+        )}
+
+        {showSummaryModal && execSummaries && (
+          <div style={styles.modalOverlay} onClick={() => setShowSummaryModal(false)}>
+            <div style={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+              <div style={styles.modalHeader}>
+                <div style={{ fontSize: 20, fontWeight: 800, color: "#0f172a" }}>תקציר מנהלים</div>
+                <button onClick={() => setShowSummaryModal(false)} style={styles.iconBtn} title="סגור">
+                  <X size={18} />
+                </button>
+              </div>
+              <div style={styles.modalBody}>
+                {Object.entries(execSummaries).map(([utility, text]) => (
+                  <div key={utility} style={{ marginBottom: 24 }}>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: "#1e40af", marginBottom: 8, borderBottom: "2px solid #dbeafe", paddingBottom: 6 }}>
+                      {utility}
+                    </div>
+                    <div style={{ whiteSpace: "pre-wrap", fontSize: 14, lineHeight: 1.7, color: "#1e293b" }}>
+                      {text}
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         )}
@@ -430,4 +506,41 @@ const styles = {
   badgeNeutral: { display: "inline-flex", padding: "6px 10px", borderRadius: 10, border: "1px solid rgba(148,163,184,0.35)", background: "rgba(248,250,252,0.9)", color: "#334155", fontWeight: 800, fontSize: 12 },
   detailTitle: { fontSize: 12, fontWeight: 800, color: "#475569", marginBottom: 4 },
   detailBody: { fontSize: 13, color: "#0f172a", whiteSpace: "pre-wrap" },
+  modalOverlay: {
+    position: "fixed",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    background: "rgba(15, 23, 42, 0.5)",
+    backdropFilter: "blur(4px)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 1000,
+    padding: 20,
+  },
+  modalContent: {
+    background: "white",
+    borderRadius: 20,
+    boxShadow: "0 25px 60px rgba(15, 23, 42, 0.25)",
+    maxWidth: 760,
+    width: "100%",
+    maxHeight: "85vh",
+    display: "flex",
+    flexDirection: "column",
+    direction: "rtl",
+  },
+  modalHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: "18px 22px",
+    borderBottom: "1px solid rgba(226,232,240,0.8)",
+  },
+  modalBody: {
+    padding: "22px 26px",
+    overflowY: "auto",
+    flex: 1,
+  },
 };

@@ -117,3 +117,53 @@ def classify_funding_with_confidence(
     conf = _clamp01(conf)
 
     return label, conf
+
+
+def generate_text(
+    prompt: str,
+    *,
+    provider: str = "gemini",
+    model: str = "gemini-1.5-flash",
+) -> str:
+    """
+    Call LLM and return raw text response (no JSON parsing).
+    Used for free-form text generation like executive summaries.
+    """
+    provider_l = (provider or "").strip().lower()
+
+    try:
+        if provider_l == "gemini":
+            import google.generativeai as gm
+
+            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if not api_key:
+                raise RuntimeError("Missing GEMINI_API_KEY/GOOGLE_API_KEY")
+
+            gm.configure(api_key=api_key)
+            m = gm.GenerativeModel(model)
+            resp = m.generate_content(prompt)
+            return (resp.text or "").strip()
+
+        elif provider_l == "openai":
+            from openai import OpenAI
+
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("Missing OPENAI_API_KEY")
+
+            client = OpenAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return (resp.choices[0].message.content or "").strip()
+
+        else:
+            raise ValueError(f"Unknown LLM provider: {provider!r} (expected 'gemini' or 'openai')")
+
+    except Exception as e:
+        msg = repr(e)
+        if any(x in msg.lower() for x in ["resourceexhausted", "quota", "rate_limit", "rate-limit", "429"]):
+            raise LLMQuotaError(msg) from e
+        raise

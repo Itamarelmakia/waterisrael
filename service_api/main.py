@@ -16,6 +16,7 @@ from water_validation.report import (
     format_all_checks_for_export,
     build_executive_summary,
     build_summary_table,
+    generate_executive_summaries,
 )
 
 app = FastAPI()
@@ -198,6 +199,10 @@ async def validate_download(background_tasks: BackgroundTasks, file: UploadFile 
 
         all_checks_export = format_all_checks_for_export(all_checks_df)
 
+        # Generate LLM executive summaries per file
+        cfg = _build_config()
+        exec_summaries = generate_executive_summaries(all_checks_df, cfg)
+
         with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
             summary_table_df.to_excel(writer, index=False, sheet_name="Summary_Table")
             executive_headline.to_excel(writer, index=False, sheet_name="Executive_Headline")
@@ -205,6 +210,12 @@ async def validate_download(background_tasks: BackgroundTasks, file: UploadFile 
             executive_fails.to_excel(writer, index=False, sheet_name="Executive_Fails")
             executive_top_rules.to_excel(writer, index=False, sheet_name="Executive_TopRules")
             all_checks_export.to_excel(writer, index=False, sheet_name="All_Checks")
+
+            for utility_name, summary_text in exec_summaries.items():
+                sheet_name = f"executive_{utility_name}"[:31]
+                pd.DataFrame({"תקציר מנהלים": [summary_text]}).to_excel(
+                    writer, sheet_name=sheet_name, index=False,
+                )
 
     except Exception as e:
         _safe_remove(out_path)
@@ -216,3 +227,22 @@ async def validate_download(background_tasks: BackgroundTasks, file: UploadFile 
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         background=background_tasks,
     )
+
+
+@app.post("/executive_summary")
+async def executive_summary(file: UploadFile = File(...)):
+    """Generate LLM executive summary for the uploaded file."""
+    in_path = _save_upload_to_tmp(file)
+
+    try:
+        all_checks_df, _, _ = _run_validation(in_path)
+        cfg = _build_config()
+        summaries = generate_executive_summaries(all_checks_df, cfg)
+        return JSONResponse(content={"summaries": summaries})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Executive summary failed: {e}")
+    finally:
+        _safe_remove(in_path)
