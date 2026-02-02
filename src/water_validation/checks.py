@@ -15,8 +15,7 @@ import math
 from .models import CheckResult, Severity, Status
 
 from difflib import SequenceMatcher
-#from prompts import SUBJECT_TO_FUNDING, ALLOWED_FUNDING_LABELS, build_llm_prompt
-from .prompts import SUBJECT_TO_FUNDING, ALLOWED_FUNDING_LABELS, build_llm_prompt
+from .prompts import SUBJECT_TO_ALLOWED, SUBJECT_SYNONYMS, ALLOWED_FUNDING_LABELS, build_llm_prompt
 
 
 #from config import PlanConfig
@@ -642,62 +641,424 @@ def check_012_project_fields_not_empty(
 
     return results
 
-# For rule 14 with Prompt LLM classification
+# =============================================================================
+# Rule 14: Funding Classification Validation (LLM/NLP)
+# =============================================================================
+
+# Fuzzy threshold constant
+R14_FUZZY_THRESHOLD = 0.50  # Confidence >= 50% -> accept fuzzy decision
+
+
 def canonicalize_label(s: str) -> str:
-    # normalize whitespace (also handles NBSP)
-    s = (s or "").replace("\u00A0", " ")
+    """
+    Canonicalize a funding label to one of the 5 allowed canonical forms.
+
+    Canonical labels:
+    - "שיקום/שדרוג"
+    - "פיתוח"
+    - "תשתית ביוב אזורית"
+    - "קידוחים"
+    - "תחזוקה / שוטף"
+    """
+    if not s:
+        return ""
+
+    # Normalize whitespace (including NBSP)
+    s = s.replace("\u00A0", " ")
     s = re.sub(r"\s+", " ", s).strip()
 
-    # normalize common variants
-    s = re.sub(r"^שיקום\s*/\s*שדרוג$", "שיקום / שדרוג", s)
-    s = re.sub(r"^תחזוקה\s*/\s*שוטף$", "תחזוקה / שוטף", s)
+    # --- תשתית ביוב אזורית variations (singular canonical) ---
+    if "תשתיות ביוב אזוריות" in s:
+        s = s.replace("תשתיות ביוב אזוריות", "תשתית ביוב אזורית")
+    if "תשתיות ביוב אזורית" in s:
+        s = s.replace("תשתיות ביוב אזורית", "תשתית ביוב אזורית")
+    if "תשתית ביוב אזוריות" in s:
+        s = s.replace("תשתית ביוב אזוריות", "תשתית ביוב אזורית")
+    if "תשתית ביוב אזורי" in s and "תשתית ביוב אזורית" not in s:
+        s = s.replace("תשתית ביוב אזורי", "תשתית ביוב אזורית")
 
-    # allow a couple of textual variants if you have them
-    s = s.replace("שיקום ושדרוג", "שיקום / שדרוג")
+    # --- קידוחים variations ---
+    # Only replace standalone "קידוח" when it's likely to be the label
+    if s == "קידוח":
+        s = "קידוחים"
+
+    # --- שיקום/שדרוג variations ---
+    s = s.replace("שיקום ושדרוג", "שיקום/שדרוג")
+    s = s.replace("שיקום ושידרוג", "שיקום/שדרוג")
+    s = s.replace("שיקום / שדרוג", "שיקום/שדרוג")
+    s = s.replace("שיקום/ שדרוג", "שיקום/שדרוג")
+    s = s.replace("שיקום /שדרוג", "שיקום/שדרוג")
+
+    # --- תחזוקה / שוטף variations (canonical has spaces around slash) ---
+    # Match various spacing patterns around the slash
+    s = re.sub(r"תחזוקה\s*/\s*שוטף", "תחזוקה / שוטף", s)
     s = s.replace("תחזוקה ושוטף", "תחזוקה / שוטף")
 
     return s
 
 
 def _token_set(s: str) -> set[str]:
+    """Split string into word tokens."""
     return set(s.split())
 
-def _best_subject_match(project_name: str) -> tuple[str, str, float]:
+
+def _best_subject_match(project_name: str) -> tuple[str, float]:
+    """
+    Find the best matching subject from SUBJECT_TO_ALLOWED using fuzzy matching.
+
+    Returns: (best_subject, score) where score is in [0..1]
+    """
     pn = normalize_text(project_name)
     pt = _token_set(pn)
 
     best_subj = ""
-    best_fund = "השקעה"
     best_score = -1.0
 
-    for subj, fund in SUBJECT_TO_FUNDING.items():  # predefined subjects - loop through all candidates in SUBJECT_TO_FUNDING in prompts.py
+    for subj in SUBJECT_TO_ALLOWED.keys():
         sn = normalize_text(subj)
         st = _token_set(sn)
 
-        # token overlap + sequence similarity
+        # Jaccard similarity on word tokens
         jacc = (len(pt & st) / len(pt | st)) if (pt or st) else 0.0
+        # Sequence similarity
         seq = SequenceMatcher(None, pn, sn).ratio()
+        # Combined score
         score = 0.55 * seq + 0.45 * jacc
 
         if score > best_score:
             best_score = score
             best_subj = subj
-            best_fund = fund
 
-    return best_subj, best_fund, best_score
+    return best_subj, float(best_score)
 
 
 def check_014_llm_project_funding_classification(
     report_df: pd.DataFrame,
     cfg: PlanConfig,
 ) -> List[CheckResult]:
+    """
+    R14 - Funding Classification Validation (LLM/NLP)
+
+    Validates that the reported funding classification (סיווג פרויקט) matches
+    the predicted classification based on project name analysis.
+
+    Pipeline order:
+    1. Keyword stage (deterministic, conf=1.0)
+    2. Fuzzy stage (synonym matching + fuzzy subject matching)
+    3. LLM stage (fallback when keyword + fuzzy fail)
+    """
+    import os
+
+    # TEMP DEBUG: Show config values at function entry
+    print(f"[R_14 DEBUG] check_014 called with cfg.llm_enabled={getattr(cfg, 'llm_enabled', 'NOT SET')}, cfg.llm_provider={getattr(cfg, 'llm_provider', 'NOT SET')}")
+
     rule_id = "R_14"
-    rule_name = "R14 - אימות מקור מימון לפי שם פרויקט (LLM)"
+    rule_name = "R14 - אימות מקור מימון לפי שם פרויקט (LLM/NLP)"
     sheet = getattr(cfg, "report_sheet_name", "גיליון דיווח")
 
+    # ---------------------------
+    # Helper functions
+    # ---------------------------
     def _norm_col(x: object) -> str:
         return re.sub(r"\s+", " ", str(x)).strip()
 
+    def _is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
+
+    def _confidence_bucket(c: float) -> str:
+        return "ביטחון גבוה" if c >= R14_FUZZY_THRESHOLD else "ביטחון נמוך"
+
+    def _final_line(method: str, label: str, conf: float) -> str:
+        """Build the method detail line (no subject)."""
+        if method == "keyword":
+            return f"סיווג סופי על ידי keyword: {label}"
+        if method == "fuzzy":
+            return f"סיווג סופי על ידי fuzzy ({_confidence_bucket(conf)}): {label} (conf={conf:.2f})"
+        if method == "llm":
+            return f"סיווג סופי על ידי LLM: {label} (conf={conf:.2f})"
+        if method == "prior":
+            return f"סיווג סופי על ידי prior (ביטחון נמוך): {label} (conf={conf:.2f})"
+        # no-decision case
+        return f"סיווג סופי על ידי LLM: לא זמין (conf=0.0)"
+
+    def _predict_by_keyword(pn: str) -> tuple[str | None, float]:
+        """
+        Keyword-based prediction (Stage A).
+        Returns: (label or None, confidence)
+
+        IMPORTANT: Only return high-precision matches here.
+        Generic terms like "חדש", "שדרוג" are handled in fuzzy stage as tie-breakers.
+        """
+        # === קידוחים/באר - highest priority, unambiguous ===
+        if ("באר" in pn) or ("קידוח" in pn) or ("קידוחים" in pn) or ("רדיוס מגן" in pn):
+            return "קידוחים", 1.0
+
+        # === מט"ש / טיהור שפכים -> תשתית ביוב אזורית ===
+        if ('מט"ש' in pn) or ("מטש" in pn) or ("מתקן טיהור" in pn) or ("טיהור שפכים" in pn):
+            return "תשתית ביוב אזורית", 1.0
+
+        # === מאסף אזורי / ראשי / חוצה -> תשתית ביוב אזורית ===
+        if "מאסף" in pn and ("אזורי" in pn or "ראשי" in pn or "חוצה" in pn):
+            return "תשתית ביוב אזורית", 1.0
+
+        # === קו הולכת שפכים/ביוב אזורי -> תשתית ביוב אזורית ===
+        if ("הולכת שפכים" in pn) or ("הולכת ביוב" in pn and "אזורי" in pn):
+            return "תשתית ביוב אזורית", 1.0
+
+        # === תחזוקה/שוטף - high precision maintenance terms ===
+        maintenance_terms = (
+            "צילום" in pn or "שטיפה" in pn or
+            "סקר " in pn or pn.startswith("סקר") or  # סקר with space or at start (avoid partial)
+            "מדידות" in pn or
+            'קר"מ' in pn or "קרמ" in pn or "קריאה מרחוק" in pn or
+            "GIS" in pn or "gis" in pn.lower() or
+            "ניתור" in pn or "ניטור" in pn or
+            "מפוחים" in pn or "מפוח" in pn or
+            "מדי מים" in pn or "מוני מים" in pn or "החלפת מדים" in pn or
+            "סייבר" in pn or "cyber" in pn.lower() or
+            "תכנית אב" in pn or "תכניות אב" in pn or
+            "הגנה קתודית" in pn or
+            "ציוד חירום" in pn or "מחסן חירום" in pn or
+            "לכידת אבנית" in pn or
+            "הפרדת ביוב" in pn or
+            "סריקות הנדסיות" in pn
+        )
+        if maintenance_terms:
+            return "תחזוקה / שוטף", 1.0
+
+        # === פיתוח - strong development zone indicators ===
+        # These are almost always new development (פיתוח)
+        pituach_strong = (
+            ('אז"ת' in pn) or ("אזת" in pn) or
+            ("אזור תעשי" in pn) or ("א.ת" in pn) or ("א.ת." in pn) or
+            ("היי-טק" in pn) or ("הייטק" in pn) or
+            ("מתחם חדש" in pn) or ("שכונה חדשה" in pn) or
+            ("ותמ\"ל" in pn) or ('ותמ"ל' in pn) or ("ותמל" in pn) or
+            ("פינוי בינוי" in pn) or ("תמא 38" in pn) or ("תמ\"א 38" in pn) or
+            # הקמת patterns - "הקמת" + infrastructure = new development
+            (pn.startswith("הקמת ") or "הקמת מערכ" in pn or "הקמת תחנ" in pn or
+             "הקמת קו" in pn or "הקמת בריכ" in pn or "הקמת מאגר" in pn)
+        )
+        if pituach_strong:
+            return "פיתוח", 0.90
+
+        # === שיקום/שדרוג - strong rehabilitation indicators ===
+        # Only return when very clear (action + infra combo)
+        shikum_strong = (
+            ("שדרוג מאסף" in pn) or ("שדרוג מאספים" in pn) or
+            ("שיקום מאסף" in pn) or ("שיקום מאספים" in pn) or
+            ("החלפת משאב" in pn) or ("החלפת משאבות" in pn) or
+            ("החלפת לוח חשמל" in pn) or
+            ("שיקום בריכ" in pn) or ("שיקום מגדל" in pn) or
+            ("איטום בריכ" in pn) or ("ציפוי בריכ" in pn) or
+            ("שיקום תחנ" in pn) or ("שדרוג תחנ" in pn) or
+            ("שיקום מערכ" in pn) or ("שדרוג מערכ" in pn) or
+            ("החלפת צנרת" in pn) or ("שיקום צנרת" in pn) or
+            ("שיקום קו" in pn) or ("שדרוג קו" in pn)
+        )
+        if shikum_strong:
+            return "שיקום/שדרוג", 0.90
+
+        # === DO NOT return generic שיקום/שדרוג or פיתוח here ===
+        # Those are handled by fuzzy stage with subject-aware tie-breaking
+        return None, 0.0
+
+    def _subject_from_synonyms_normalized(pn_normalized: str) -> str | None:
+        """
+        Deterministic synonym matching using normalized text.
+        Both the project name and synonym keys are compared in normalized form.
+        """
+        for key, subject in SUBJECT_SYNONYMS.items():
+            key_norm = normalize_text(key)
+            if key_norm and (key_norm in pn_normalized):
+                return subject
+        return None
+
+    def _apply_tiebreaker(pn: str, allowed_set: set[str]) -> str | None:
+        """
+        Apply keyword-based tie-breaker when allowed_set has exactly 2 options.
+        Returns label if tie-breaker succeeds, None otherwise.
+        """
+        if allowed_set != {"שיקום/שדרוג", "פיתוח"}:
+            return None  # Only apply tie-breaker for this specific pair
+
+        # שיקום/שדרוג indicators (strong)
+        shikum_terms = (
+            "החלפה" in pn or "החלפת" in pn or
+            "שיקום" in pn or "שדרוג" in pn or
+            "חידוש" in pn or "חידושי" in pn or
+            "שיפוץ" in pn or "תיקון" in pn or
+            "איטום" in pn or "ציפוי" in pn or
+            "שיפור" in pn or "חיזוק" in pn or
+            "ישן" in pn or "קיימ" in pn  # "existing" indicators
+        )
+
+        # פיתוח indicators (strong)
+        pituach_terms = (
+            "הקמה" in pn or "הקמת" in pn or
+            "חדש" in pn or "חדשה" in pn or "חדשים" in pn or
+            "תוספת" in pn or "תוספות" in pn or
+            "הרחבה" in pn or "הרחבת" in pn or
+            "השלמת" in pn or "השלמה" in pn or  # Completing = new work
+            "שלב ב" in pn or "שלב ג" in pn or "שלב 2" in pn or "שלב 3" in pn or
+            "ותמל" in pn or 'ותמ"ל' in pn or "ותמ\"ל" in pn or
+            "שכונה חדשה" in pn or "מתחם חדש" in pn or
+            "פינוי בינוי" in pn or "תמא 38" in pn or
+            "מתחם א" in pn or "מתחם ב" in pn  # Development phases
+        )
+
+        if shikum_terms and not pituach_terms:
+            return "שיקום/שדרוג"
+        if pituach_terms and not shikum_terms:
+            return "פיתוח"
+        # Both or neither - can't decide
+        return None
+
+    def _predict_by_fuzzy(pn: str, project_name: str) -> tuple[str | None, float, set[str] | None]:
+        """
+        Fuzzy/synonym-based prediction (Stage B).
+        Returns: (label or None, confidence, candidate_allowed_set for LLM fallback)
+
+        Logic:
+        1. Try synonym matching to find subject
+        2. Look up allowed_set for subject
+        3. If single label -> return it
+        4. If 2 labels (שיקום/שדרוג, פיתוח) -> apply tie-breaker
+        5. If tie-breaker fails -> return allowed_set for LLM
+        """
+        pn_normalized = normalize_text(project_name)
+
+        # ========================================
+        # Step 1: Try synonym substring matching
+        # ========================================
+        subj = _subject_from_synonyms_normalized(pn_normalized)
+        if subj:
+            # Direct label match (e.g., קידוחים)
+            if subj in ALLOWED_FUNDING_LABELS:
+                return canonicalize_label(subj), 0.90, None
+
+            # Look up allowed set for this subject
+            allowed_set = SUBJECT_TO_ALLOWED.get(subj, set())
+
+            if allowed_set and len(allowed_set) == 1:
+                # Single option - deterministic
+                return canonicalize_label(next(iter(allowed_set))), 0.90, None
+
+            if allowed_set and len(allowed_set) == 2:
+                # Try tie-breaker
+                result = _apply_tiebreaker(pn, allowed_set)
+                if result:
+                    return result, 0.85, None
+                # Tie-breaker failed - pass to LLM with narrowed set
+                return None, 0.50, allowed_set
+
+        # ========================================
+        # Step 2: No synonym match - try fuzzy subject matching
+        # ========================================
+        subj, score = _best_subject_match(project_name)
+        if not subj:
+            # No subject found at all - try to classify by keywords alone
+            # Default to קווים קצרים which allows {שיקום/שדרוג, פיתוח}
+            default_allowed = {"שיקום/שדרוג", "פיתוח"}
+            result = _apply_tiebreaker(pn, default_allowed)
+            if result:
+                return result, 0.60, None
+            return None, 0.0, default_allowed
+
+        allowed_set = SUBJECT_TO_ALLOWED.get(subj, set())
+        if not allowed_set:
+            return None, 0.0, None
+
+        # ========================================
+        # Step 3: Apply fuzzy threshold
+        # ========================================
+        if score >= R14_FUZZY_THRESHOLD:
+            if len(allowed_set) == 1:
+                return canonicalize_label(next(iter(allowed_set))), score, None
+
+            # Multiple options - try tie-breaker
+            result = _apply_tiebreaker(pn, allowed_set)
+            if result:
+                return result, score, None
+            # Tie-breaker failed - pass to LLM
+            return None, score, allowed_set
+
+        # Below threshold - still try tie-breaker with lower confidence
+        if len(allowed_set) == 2:
+            result = _apply_tiebreaker(pn, allowed_set)
+            if result:
+                return result, 0.55, None
+            return None, score, allowed_set
+
+        return None, score, allowed_set
+
+    def _predict_by_llm(project_name: str, allowed_set: set[str] | None) -> tuple[str | None, float]:
+        """
+        LLM-based prediction (Stage C).
+        Returns: (label or None, confidence)
+
+        IMPORTANT: Only call LLM when allowed_set == {שיקום/שדרוג, פיתוח}
+        For other cases, deterministic classification should have succeeded.
+        """
+        # Only call LLM for the specific 2-way ambiguity case
+        target_set = {"שיקום/שדרוג", "פיתוח"}
+        if allowed_set != target_set:
+            print(f"[R_14 DEBUG] LLM SKIPPED: allowed_set={allowed_set} != target {target_set}")
+            return None, 0.0
+
+        llm_enabled = bool(getattr(cfg, "llm_enabled", False))
+        provider = getattr(cfg, "llm_provider", "gemini")
+        provider_l = (provider or "").strip().lower()
+
+        if provider_l == "gemini":
+            has_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+            default_model = "gemini-1.5-flash"
+        else:
+            has_key = bool(os.getenv("OPENAI_API_KEY"))
+            default_model = "gpt-4o-mini"
+
+        # TEMP DEBUG: Show why LLM is skipped or called
+        print(f"[R_14 DEBUG] _predict_by_llm called: project={project_name[:30]!r}, llm_enabled={llm_enabled}, has_key={has_key}, provider={provider_l}")
+
+        if not (llm_enabled and has_key):
+            print(f"[R_14 DEBUG] LLM SKIPPED: llm_enabled={llm_enabled}, has_key={has_key}")
+            return None, 0.0
+
+        try:
+            from .llm_client import classify_funding_with_confidence, LLMQuotaError
+
+            model = getattr(cfg, "llm_model", default_model)
+
+            # LLM only chooses between שיקום/שדרוג and פיתוח
+            prompt = build_llm_prompt(project_name, allowed_set=target_set)
+            print(f"[R_14 DEBUG] Calling LLM with model={model}, allowed_set={target_set}")
+            llm_label, llm_conf = classify_funding_with_confidence(
+                prompt, provider=provider_l, model=model
+            )
+            print(f"[R_14 DEBUG] LLM returned: label={llm_label!r}, conf={llm_conf}")
+
+            return canonicalize_label(llm_label), float(llm_conf)
+
+        except LLMQuotaError:
+            # Quota exceeded - graceful fallback
+            return None, 0.0
+        except Exception as e:
+            print(f"[R_14] LLM error (provider={provider_l}): {e!r}")
+            return None, 0.0
+
+    # ---------------------------
+    # Column resolution
+    # ---------------------------
     col_map = {_norm_col(c): c for c in report_df.columns}
     project_col = col_map.get("שם פרויקט")
     class_col = col_map.get("סיווג פרויקט")
@@ -725,116 +1086,194 @@ def check_014_llm_project_funding_classification(
             )
         ]
 
-    #if hasattr(cfg, "llm_enabled") and not cfg.llm_enabled:
-    #    return []
+    # Row filtering setup
+    id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
+    id_col = col_map.get(id_norm)
 
+    def _is_real_row(idx: int) -> bool:
+        if not id_col:
+            return True
+        v = report_df.at[idx, id_col]
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return False
+        s = str(v).strip()
+        if s in {"-", "", "nan", "None", "none"}:
+            return False
+        return True
+
+    # Config flag for שיקום/שדרוג special treatment
+    shikum_not_investment = bool(getattr(cfg, "r14_shikum_not_investment", False))
+
+    # ---------------------------
+    # Stage B3: Prior fallback from reported distribution
+    # ---------------------------
+    # Templates for bucketing generic project names (ordered by priority)
+    PRIOR_TEMPLATES = [
+        # Core infra patterns
+        ("קווי מים", "קווי מים"),
+        ("קו מים", "קו מים"),
+        ("קווי ביוב", "קווי ביוב"),
+        ("קו ביוב", "קו ביוב"),
+        ("מערכת מים", "מערכת מים"),
+        ("מערכת ביוב", "מערכת ביוב"),
+        ("מאסף ביוב", "מאסף ביוב"),
+        ("מאסף", "מאסף"),
+        ("קו אספקה", "קו אספקה"),
+        ("אספקת מים", "אספקת מים"),
+        # Facilities
+        ("תחנת שאיבה", "תחנת שאיבה"),
+        ("תחנת בוסטרים", "בוסטרים"),
+        ("בוסטר", "בוסטרים"),
+        ("תחנת שאיבת מים", "תחנת שאיבת מים"),
+        ("תחנת שאיבה", "תחנת שאיבה"),
+        ("מאגר", "מאגר"),
+        ("מערכת בקרה", "בקרה"),
+        ("פיקוד ובקרה", "בקרה"),
+        ("מיגון", "בקרה"),
+        ("מגוף", "מגוף"),
+        # Development zones (tend toward פיתוח)
+        ('אז"ת', "אזור תעשייה"),
+        ("אזור תעשייה", "אזור תעשייה"),
+        ("א.ת", "אזור תעשייה"),
+        ("היי-טק", "היי-טק"),
+        ("הייטק", "היי-טק"),
+        ("מתחם", "מתחם"),
+        # Generic location patterns (most common, order matters - specific first)
+        ("בשכונת", "שכונה"),  # More specific first
+        ("בשכונה", "שכונה"),
+        ("שכונת", "שכונה"),
+        ("שכונה", "שכונה"),
+        ("באזורים שונים", "אזורים"),
+        ("במוקדים שונים", "אזורים"),
+        ("אזורים מפוזרים", "אזורים"),
+        ("אזורים שונים", "אזורים"),
+        ("באזור", "אזורים"),
+        # Road/highway patterns
+        ("בכביש", "כביש"),
+        ("כביש", "כביש"),
+        ("ציר", "ציר"),
+        ("ברחוב", "רחוב"),
+        # Municipal patterns
+        ("גרעין הישוב", "גרעין"),
+        ("מרכז הישוב", "מרכז"),
+        ("במרכז הישוב", "מרכז"),
+        ("הסעת המונים", "הסעת המונים"),
+        # Direction patterns
+        ("צפוני", "כיוון"),
+        ("דרומי", "כיוון"),
+        ("מזרחי", "כיוון"),
+        ("מערבי", "כיוון"),
+        ("לכיוון", "כיוון"),
+    ]
+
+    PRIOR_MIN_SUPPORT = 5   # Minimum rows to learn prior (lowered from 8)
+    PRIOR_MIN_SKEW = 0.67   # Minimum ratio for strong prior (lowered from 0.75)
+
+    def _match_template(pn_norm: str) -> str | None:
+        """Match project name to first matching template."""
+        for pattern, template_name in PRIOR_TEMPLATES:
+            if pattern in pn_norm:
+                return template_name
+        return None
+
+    def _has_infra_or_action_token(pn_norm: str) -> bool:
+        """
+        Check if name has infrastructure or action tokens (not just location).
+        This prevents classifying names like "שכונה צפונית" as location-only
+        when they clearly have infra/action terms.
+        """
+        # Infrastructure tokens
+        infra_tokens = [
+            "קו", "קווי", "מערכת", "מים", "ביוב", "מאסף", "מאספים",
+            "תחנה", "מאגר", "בריכ", "משאב", "סניקה", "בוסטר", "בוסטרים",
+            'אז"ת', "אזור תעשי", "היי-טק", "הייטק", "מתחם",
+            "מגוף", "מגופים", "מגוף מכני",
+            'תש"ב', "תשב",  # תחנת שאיבה abbreviation
+            "ותמ\"ל", 'ותמ"ל', "ותמל",  # Development projects
+            "צנרת", "רשת",
+        ]
+        # Action tokens (שיקום/שדרוג or פיתוח indicators)
+        action_tokens = [
+            "שדרוג", "שיקום", "החלפ", "חידוש", "שיפוץ", "תיקון",
+            "איטום", "ציפוי",  # Rehabilitation
+            "הקמ", "חדש", "תוספ", "הרחב", "בנייה", "בניה",  # Development
+        ]
+        all_tokens = infra_tokens + action_tokens
+        return any(t in pn_norm for t in all_tokens)
+
+    # Compute priors from reported values (once per run)
+    template_counts: dict[str, dict[str, int]] = {}  # template -> {label: count}
+    target_labels = {"שיקום/שדרוג", "פיתוח"}
+
+    for idx, row in report_df.iterrows():
+        if not _is_real_row(idx):
+            continue
+        pn_raw = str(row.get(project_col, "")).strip()
+        reported_raw = str(row.get(class_col, "")).strip()
+        if not pn_raw or pn_raw.lower() == "nan":
+            continue
+        reported_label = canonicalize_label(reported_raw)
+        if reported_label not in target_labels:
+            continue
+        pn_norm = normalize_text(pn_raw)
+        template = _match_template(pn_norm)
+        if template:
+            if template not in template_counts:
+                template_counts[template] = {"שיקום/שדרוג": 0, "פיתוח": 0}
+            template_counts[template][reported_label] += 1
+
+    def _get_prior(pn_norm: str) -> tuple[str | None, float]:
+        """
+        Get prior prediction based on template distribution.
+        Returns (label, conf) or (None, 0).
+
+        Uses tiered confidence:
+        - Strong skew (>=67%) + good support (>=5): conf=0.60
+        - Moderate skew (>=55%) + some support (>=3): conf=0.50
+        - Weak majority (>50%) + minimal support (>=2): conf=0.45
+        """
+        template = _match_template(pn_norm)
+        if not template or template not in template_counts:
+            return None, 0.0
+        counts = template_counts[template]
+        total = counts["שיקום/שדרוג"] + counts["פיתוח"]
+        if total < 2:  # Need at least 2 examples
+            return None, 0.0
+
+        winner = "שיקום/שדרוג" if counts["שיקום/שדרוג"] >= counts["פיתוח"] else "פיתוח"
+        ratio = counts[winner] / total
+
+        # Tiered confidence based on support and skew
+        if total >= PRIOR_MIN_SUPPORT and ratio >= PRIOR_MIN_SKEW:
+            return winner, 0.60  # Strong prior
+        if total >= 3 and ratio >= 0.55:
+            return winner, 0.50  # Moderate prior
+        if total >= 2 and ratio > 0.50:
+            return winner, 0.45  # Weak prior
+        # Even split - can't decide
+        return None, 0.0
+
+    # ---------------------------
+    # Main loop
+    # ---------------------------
     results: List[CheckResult] = []
 
     for idx, row in report_df.iterrows():
-        project_name = str(row.get(project_col, "")).strip()
-        reported = str(row.get(class_col, "")).strip()
+        if not _is_real_row(idx):
+            continue
 
+        project_name = str(row.get(project_col, "")).strip()
         if not project_name or project_name.lower() == "nan":
             continue
 
-        if not reported or reported.lower() == "nan":
-            reported = ""
+        reported_raw = str(row.get(class_col, "")).strip()
 
-        # -------------------------
-        # Predict expected funding: keyword -> fuzzy -> LLM fallback
-        # (ALWAYS produces a value in predicted)
-        # -------------------------
-        # predicted + confidence
-        pn = normalize_text(project_name)
-
-        # -------------------------
-        # R_16 override (highest priority):
-        # אם בשם הפרויקט יש "באר" או "קידוח" => סיווג חייב להיות "קידוח" בביטחון 100%
-        # -------------------------
-        r16_triggered = ("באר" in pn) or ("קידוח" in pn)
-
-
-        if r16_triggered:
-            predicted = canonicalize_label("קידוח")
-            confidence = 1.0
-            method = "חוק R_16"
-
-        elif ("החלפת משאבה" in pn) or ("החלפת משאבות" in pn):
-            predicted = "השקעה"
-            predicted = canonicalize_label(predicted)
-
-            confidence = 1.0
-            method = "מילות-מפתח"
-
-        else:
-            subj, predicted, score = _best_subject_match(project_name)
-            predicted = canonicalize_label(predicted)
-
-            confidence = float(score)           # ✅ fuzzy confidence
-            method = f"התאמה-טקסטואלית ({score:.2f})"
-
-
-            if score < 0.50:
-                import os
-
-                llm_enabled = bool(getattr(cfg, "llm_enabled", False))
-                has_key = bool(os.getenv("OPENAI_API_KEY"))
-
-                if llm_enabled and has_key:
-                    try:
-                        from .llm_client import classify_funding_with_confidence  # import רק כשצריך
-
-                        prompt = build_llm_prompt(project_name)
-                        model = getattr(cfg, "llm_model", "gpt-4o")
-                        #predicted_llm, conf_llm = classify_funding_with_confidence(prompt, model=model)
-                        
-                        provider = getattr(cfg, "llm_provider", "gemini")
-                        predicted_llm, conf_llm = classify_funding_with_confidence(prompt, provider=provider, model=model)
-
-
-
-                        predicted = canonicalize_label(predicted_llm)
-                        confidence = float(conf_llm)
-                        method = f"LLM ({model})"
-                    except Exception:
-                        method = "LLM נכשל – fallback להתאמה-טקסטואלית"
-                else:
-                    # אין מפתח / לא מופעל: נשארים על fuzzy
-                    method = "LLM כבוי או חסר OPENAI_API_KEY – NLP בלבד"
-
-
-        predicted = canonicalize_label(predicted)
-        reported = canonicalize_label(reported)
-        law_note = " (לפי חוק R_16)" if r16_triggered else ""
-
-        # Validate LLM output; if invalid, fallback to fuzzy
-        if predicted not in ALLOWED_FUNDING_LABELS:
-            subj2, predicted2, score2 = _best_subject_match(project_name)
-            predicted = predicted2
-            confidence = float(score2)
-            method = f"fallback התאמה-טקסטואלית ({score2:.2f})"
-
-
-
-        # -------------------------
-        # Canonicalize labels for comparison (fix: שיקום/שדרוג == שיקום / שדרוג)
-        # -------------------------
-        reported_raw = reported
-        predicted_raw = predicted
-
-        reported_c = canonicalize_label(reported_raw)
-        predicted_c = canonicalize_label(predicted_raw)
-
-        # use canonical versions for validation/compare
-        reported = reported_c
-        predicted = predicted_c
-
-
-        # -------------------------
-        # Validate reported vs predicted
-        # -------------------------
-        # reported not legal -> FAIL
-        if reported_c not in ALLOWED_FUNDING_LABELS:
+        # --- Check 1: Missing reported value ---
+        if _is_empty(reported_raw):
+            msg = (
+                "נכשל - ערך חסר בעמודת סיווג פרויקט\n"
+                "סיווג סופי על ידי keyword: (אין)"
+            )
             results.append(
                 CheckResult(
                     rule_id=rule_id,
@@ -843,23 +1282,141 @@ def check_014_llm_project_funding_classification(
                     sheet_name=sheet,
                     row_index=idx,
                     column_name="סיווג פרויקט",
-                    confidence=confidence,
-                    method=method,   # ✅ ADD THIS
-                    key_context=f"project_name={project_name}",
-                    actual_value=reported_raw,
-                    expected_value=predicted_c,
                     status=Status.FAIL,
-                    message=(
-                        f"נכשל: הערך בדוח אינו מקור מימון חוקי: '{reported_raw}'. "
-                        f"הצפוי לפי שם פרויקט: '{predicted_c}' (method={method}){law_note}"
-
-                    ),
+                    message=msg,
+                    actual_value="(ריק)",
+                    expected_value=" | ".join(sorted(ALLOWED_FUNDING_LABELS)),
+                    key_context=f"project_name={project_name}",
                 )
             )
             continue
 
-        # match -> PASS
-        if predicted_c == reported_c:
+        reported = canonicalize_label(reported_raw)
+
+        # --- Check 2: Illegal reported value ---
+        if reported and (reported not in ALLOWED_FUNDING_LABELS):
+            msg = (
+                f"נכשל - ערך לא חוקי: '{reported_raw}'\n"
+                "סיווג סופי על ידי keyword: (אין)"
+            )
+            results.append(
+                CheckResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    sheet_name=sheet,
+                    row_index=idx,
+                    column_name="סיווג פרויקט",
+                    status=Status.FAIL,
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value=" | ".join(sorted(ALLOWED_FUNDING_LABELS)),
+                    key_context=f"project_name={project_name}",
+                )
+            )
+            continue
+
+        pn = normalize_text(project_name)
+
+        # --- Pipeline: Predict label ---
+        predicted = None
+        method = None
+        confidence = 0.0
+        candidate_allowed_set = None
+
+        # Stage A: Keyword
+        kw_label, kw_conf = _predict_by_keyword(pn)
+        # TEMP DEBUG
+        print(f"[R_14 DEBUG] Row {idx}: project={project_name[:40]!r}")
+        print(f"[R_14 DEBUG]   Keyword stage: label={kw_label!r}, conf={kw_conf}")
+        if kw_label is not None:
+            predicted = canonicalize_label(kw_label)
+            method = "keyword"
+            confidence = kw_conf
+
+        # Stage B: Fuzzy (only if keyword didn't decide)
+        if predicted is None:
+            fuzzy_label, fuzzy_conf, fuzzy_allowed = _predict_by_fuzzy(pn, project_name)
+            # TEMP DEBUG
+            print(f"[R_14 DEBUG]   Fuzzy stage: label={fuzzy_label!r}, conf={fuzzy_conf}, allowed={fuzzy_allowed}")
+            if fuzzy_label is not None:
+                predicted = canonicalize_label(fuzzy_label)
+                method = "fuzzy"
+                confidence = fuzzy_conf
+            else:
+                candidate_allowed_set = fuzzy_allowed
+
+        # Stage C: LLM (only if keyword + fuzzy failed)
+        if predicted is None:
+            print(f"[R_14 DEBUG]   -> Entering LLM stage (keyword+fuzzy failed)")
+            llm_label, llm_conf = _predict_by_llm(project_name, candidate_allowed_set)
+            if llm_label is not None:
+                predicted = canonicalize_label(llm_label)
+                method = "llm"
+                confidence = llm_conf
+        else:
+            print(f"[R_14 DEBUG]   -> LLM SKIPPED (predicted already set by {method})")
+
+        # Stage D: Prior fallback
+        # Run when:
+        # 1. Still no prediction AND
+        # 2. Either allowed_set is the 2-way ambiguity OR name matches a strong template
+        if predicted is None:
+            use_prior = False
+            # Case 1: Explicit 2-way ambiguity from fuzzy stage
+            if candidate_allowed_set == {"שיקום/שדרוג", "פיתוח"}:
+                use_prior = True
+            # Case 2: Subject matching failed but name matches a strong infra template
+            # (templates like מערכת/קווי/מאסף + מים/ביוב imply 2-way ambiguity)
+            elif candidate_allowed_set is None or len(candidate_allowed_set or set()) == 0:
+                template = _match_template(pn)
+                if template is not None:
+                    use_prior = True
+                    print(f"[R_14 DEBUG]   -> Template matched ({template}), enabling prior fallback")
+
+            if use_prior:
+                prior_label, prior_conf = _get_prior(pn)
+                if prior_label is not None:
+                    print(f"[R_14 DEBUG]   -> Prior fallback: label={prior_label!r}, conf={prior_conf}")
+                    predicted = prior_label
+                    method = "prior"
+                    confidence = prior_conf
+
+        # Stage E: Global fallback - use overall file distribution for 2-way ambiguity
+        # Only when we have clear infra pattern but no template-specific prior
+        if predicted is None and candidate_allowed_set == {"שיקום/שדרוג", "פיתוח"}:
+            # Check if name has clear infra pattern
+            has_clear_infra = any(t in pn for t in ["מערכת", "קווי", "קו ", "מאסף", "תחנ", "מאגר"])
+            if has_clear_infra:
+                # Use global distribution from template_counts
+                global_shikum = sum(c.get("שיקום/שדרוג", 0) for c in template_counts.values())
+                global_pituach = sum(c.get("פיתוח", 0) for c in template_counts.values())
+                total = global_shikum + global_pituach
+                if total >= 10:  # Need reasonable sample
+                    dominant = "שיקום/שדרוג" if global_shikum >= global_pituach else "פיתוח"
+                    ratio = max(global_shikum, global_pituach) / total
+                    if ratio >= 0.55:  # At least 55% skew
+                        print(f"[R_14 DEBUG]   -> Global fallback: {dominant} ({ratio:.0%} of {total})")
+                        predicted = dominant
+                        method = "prior"
+                        confidence = 0.40  # Very low confidence
+
+        # --- No decision (keyword/fuzzy/LLM/prior all failed or unavailable) ---
+        # Show the row with INFO status instead of skipping
+        if predicted is None:
+            # Check if this is a location-only name (no infra/action tokens)
+            if not _has_infra_or_action_token(pn):
+                print(f"[R_14 DEBUG]   -> No prediction: location-only name")
+                msg = (
+                    "לא ניתן לסווג - שם פרויקט כללי/מיקום בלבד (חסר סוג תשתית/פעולה)\n"
+                    "סיווג סופי: לא זמין"
+                )
+            else:
+                print(f"[R_14 DEBUG]   -> No prediction available, showing as INFO")
+                msg = (
+                    "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
+                    "סיווג סופי: לא זמין"
+                )
             results.append(
                 CheckResult(
                     rule_id=rule_id,
@@ -868,43 +1425,27 @@ def check_014_llm_project_funding_classification(
                     sheet_name=sheet,
                     row_index=idx,
                     column_name="סיווג פרויקט",
-                    confidence=confidence,
-                    key_context=f"project_name={project_name}",
+                    status=Status.INFO,
+                    message=msg,
                     actual_value=reported_raw,
-                    expected_value=predicted_c,
-                    status=Status.PASS_,
-                    message=f"עבר: הערך בדוח תואם לצפוי (method={method}){law_note}",
-
+                    expected_value="(לא ניתן לחזות)",
+                    key_context=f"project_name={project_name}",
+                    confidence=0.0,
+                    method="none",
                 )
             )
             continue
 
-        # mismatch -> FAIL
-        results.append(
-            CheckResult(
-                rule_id=rule_id,
-                rule_name=rule_name,
-                severity=Severity.WARNING,
-                sheet_name=sheet,
-                row_index=idx,
-                column_name="סיווג פרויקט",
-                confidence=confidence,
-                key_context=f"project_name={project_name}",
-                actual_value=reported_raw,
-                expected_value=predicted_c,
-                status=Status.FAIL,
-                message=f"נכשל: אי־התאמה. בדוח='{reported_raw}', צפוי='{predicted_c}' (method={method}){law_note}",
+        # Ensure canonical forms
+        predicted = canonicalize_label(predicted)
+        reported = canonicalize_label(reported)
 
+        # --- Hard rule: תחזוקה / שוטף is NOT investment ---
+        if reported == "תחזוקה / שוטף":
+            msg = (
+                "נכשל - לפי ערך בפועל: אינו שייך לתוכנית השקעה\n"
+                + _final_line(method, predicted, confidence)
             )
-        )
-
-
-        """
-        cersion where we remove all "עבר" results and only emit FAILs
-        # -------------------------
-        # Validate reported vs predicted
-        # -------------------------
-        if reported not in ALLOWED_FUNDING_LABELS:
             results.append(
                 CheckResult(
                     rule_id=rule_id,
@@ -913,20 +1454,22 @@ def check_014_llm_project_funding_classification(
                     sheet_name=sheet,
                     row_index=idx,
                     column_name="סיווג פרויקט",
-                    confidence=confidence,
-                    key_context=f"project_name={project_name}",
-                    actual_value=reported_raw,
-                    expected_value=predicted,          # ✅ always filled
                     status=Status.FAIL,
-                    message=(
-                        f"ערך בדוח אינו מקור מימון חוקי: '{reported_raw}'. "
-                        f"לפי שם פרויקט, מקור המימון הצפוי: '{predicted}' (method={method})"
-                    ),
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value="(לא תחזוקה / שוטף)",
+                    key_context=f"project_name={project_name}",
+                    confidence=confidence,
+                    method=method,
                 )
             )
             continue
 
-        if predicted != reported:
+        if predicted == "תחזוקה / שוטף":
+            msg = (
+                "נכשל - לפי ערך צפוי: אינו שייך לתוכנית השקעה\n"
+                + _final_line(method, predicted, confidence)
+            )
             results.append(
                 CheckResult(
                     rule_id=rule_id,
@@ -934,18 +1477,145 @@ def check_014_llm_project_funding_classification(
                     severity=Severity.WARNING,
                     sheet_name=sheet,
                     row_index=idx,
-                    column_name=class_col,
-                    key_context=f"project_name={project_name}",
-                    actual_value=reported_raw,
-                    expected_value=predicted,          # ✅ always filled
+                    column_name="סיווג פרויקט",
                     status=Status.FAIL,
-                    message=f"מקור מימון לא תואם. בדוח='{reported}', צפוי='{predicted}' (method={method})",
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value="(לא תחזוקה / שוטף)",
+                    key_context=f"project_name={project_name}",
+                    confidence=confidence,
+                    method=method,
                 )
-            ) 
-        """
+            )
+            continue
+
+        # --- Optional: שיקום/שדרוג NOT investment mode ---
+        if shikum_not_investment and reported == "שיקום/שדרוג" and predicted == "שיקום/שדרוג":
+            msg = (
+                "נכשל - לפי דרישת לקוח: שיקום/שדרוג אינו שייך לתוכנית השקעה\n"
+                + _final_line(method, predicted, confidence)
+            )
+            results.append(
+                CheckResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    severity=Severity.WARNING,
+                    sheet_name=sheet,
+                    row_index=idx,
+                    column_name="סיווג פרויקט",
+                    status=Status.FAIL,
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value="(לא שיקום/שדרוג)",
+                    key_context=f"project_name={project_name}",
+                    confidence=confidence,
+                    method=method,
+                )
+            )
+            continue
+
+        # --- Compare reported vs predicted ---
+        LOW_CONF_THRESHOLD = 0.70  # Below this = low confidence (gray/INFO)
+
+        # Special note for prior-based predictions
+        prior_note = ""
+        if method == "prior":
+            prior_note = "\n(סיווג בוצע לפי התפלגות ערכים מדווחים בתאגיד עבור תבנית שם דומה. ייתכן שהשם כללי מדי.)"
+
+        if reported == predicted:
+            # Check if low confidence match
+            if confidence < LOW_CONF_THRESHOLD and method != "keyword":
+                # Low confidence PASS - show as PASS with INFO severity (gray)
+                msg = f"עבר (ביטחון נמוך): התאמה\n{_final_line(method, predicted, confidence)}{prior_note}"
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.INFO,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.PASS_,  # Show עבר but with gray styling
+                        message=msg,
+                        actual_value=reported_raw,
+                        expected_value=predicted,
+                        key_context=f"project_name={project_name}",
+                        confidence=confidence,
+                        method=method,
+                    )
+                )
+            else:
+                # High confidence PASS (prior always has low conf, so won't reach here)
+                msg = f"עבר: התאמה\n{_final_line(method, predicted, confidence)}{prior_note}"
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.INFO,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.PASS_,
+                        message=msg,
+                        actual_value=reported_raw,
+                        expected_value=predicted,
+                        key_context=f"project_name={project_name}",
+                        confidence=confidence,
+                        method=method,
+                    )
+                )
+        else:
+            # FAIL - mismatch
+            if confidence < LOW_CONF_THRESHOLD and method != "keyword":
+                # Low confidence FAIL - show as FAIL with INFO severity (gray)
+                msg = (
+                    "אי-התאמה (ביטחון נמוך)\n"
+                    + _final_line(method, predicted, confidence)
+                    + prior_note
+                )
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.INFO,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.FAIL,  # Show נכשל but with gray styling
+                        message=msg,
+                        actual_value=reported_raw,
+                        expected_value=predicted,
+                        key_context=f"project_name={project_name}",
+                        confidence=confidence,
+                        method=method,
+                    )
+                )
+            else:
+                # High confidence FAIL (prior always has low conf, so won't reach here)
+                msg = (
+                    "נכשל - סיווג לא תואם\n"
+                    + _final_line(method, predicted, confidence)
+                    + prior_note
+                )
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.FAIL,
+                        message=msg,
+                        actual_value=reported_raw,
+                        expected_value=predicted,
+                        key_context=f"project_name={project_name}",
+                        confidence=confidence,
+                        method=method,
+                    )
+                )
 
     return results
-
 
 
 

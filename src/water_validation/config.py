@@ -57,9 +57,14 @@ class PlanConfig:
     #llm_validate_all: bool = True
 
     # --- LLM (Rule 14) ---
-    llm_enabled: bool = False
+    llm_enabled: bool = True
     llm_provider: str = "gemini"          # "gemini" | "openai"
-    llm_model: str = "gemini-1.5-flash"   # אפשר לשנות אחר כך לפי מה שיש לך בפועל
+    llm_model: str = "models/gemini-flash-lite-latest"
+
+    # --- R14 special flags ---
+    # If True, "שיקום/שדרוג" is treated as NOT investment (always FAIL)
+    # Default is False (normal behavior: שיקום/שדרוג is a valid investment label)
+    r14_shikum_not_investment: bool = False
 
 
 

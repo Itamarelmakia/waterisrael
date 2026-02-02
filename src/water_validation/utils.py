@@ -13,8 +13,33 @@ from .config import PlanConfig
 
 
 def normalize_text(value: object) -> str:
+    """
+    Normalize Hebrew text for consistent comparison.
+    Handles spelling variations, quote marks, and common abbreviations.
+    """
     s = "" if value is None else str(value)
+    # Remove RTL/LTR markers
     s = s.replace("\u200f", "").replace("\u200e", "")
+
+    # Normalize various quote marks to standard Hebrew quote
+    # ' (apostrophe), ʹ (modifier letter prime), ׳ (Hebrew punctuation geresh)
+    s = re.sub(r"['\u0027\u02B9\u05F3]", '"', s)
+    # " (double quote), ″ (double prime), ״ (Hebrew gershayim)
+    s = re.sub(r'["\u0022\u2033\u05F4]', '"', s)
+
+    # Unify common spelling variations
+    # איזורים → אזורים (extra yod)
+    s = re.sub(r"איזור", "אזור", s)
+    # שידרוג → שדרוג (extra yod)
+    s = re.sub(r"שידרוג", "שדרוג", s)
+    # מכאני → מכני (extra alef)
+    s = re.sub(r"מכאני", "מכני", s)
+    # מגוב → מגוף (common typo)
+    s = re.sub(r"\bמגוב\b", "מגוף", s)
+    # Expand שכ' abbreviation to שכונה (match שכ" or שכ')
+    s = re.sub(r'\bשכ["\']', "שכונה", s)
+
+    # Normalize whitespace
     s = re.sub(r"\s+", " ", s).strip()
     return s
 

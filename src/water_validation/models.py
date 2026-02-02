@@ -11,9 +11,10 @@ class Severity(str, Enum):
 
 
 class Status(str, Enum):
-    PASS_ = "Pass"
-    FAIL = "Fail"
-    NOT_APPLICABLE = "Not applicable"
+    PASS_ = "עבר"
+    FAIL = "נכשל"
+    INFO = "לא ידוע"  # For no prediction available
+    NOT_APPLICABLE = "לא רלוונטי"
 
 
 @dataclass
