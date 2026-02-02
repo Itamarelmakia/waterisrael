@@ -77,12 +77,92 @@ FINAL_COLS = [
     "ביטחון",
     "סטטוס",
     "עמודה באקסל",
+    "שורה באקסל",
     "בדיקה שבוצעה",
     "הערות מערכת",
     "פירוט הבדיקה",
 ]
 
 import re
+
+# --- Excel cell reference parsing helpers ---
+_CELL_RE = re.compile(r"!?([A-Z]{1,3})(\d+)$")  # matches "G8" or "!G8" at end
+
+
+def _parse_excel_cells(excel_cells) -> list[tuple[str, int]]:
+    """
+    Parse excel_cells list (e.g. ['גיליון דיווח!G8']) into [(letter, row), ...].
+    """
+    if not excel_cells:
+        return []
+    cells = excel_cells
+    if isinstance(cells, str):
+        try:
+            cells = json.loads(cells)
+        except Exception:
+            cells = [cells]
+    if not isinstance(cells, list):
+        return []
+    out = []
+    for cell in cells:
+        if not cell:
+            continue
+        s = str(cell)
+        # extract the "G8" part after "!"
+        addr = s.split("!", 1)[1] if "!" in s else s
+        m = re.match(r"([A-Z]{1,3})(\d+)$", addr.strip())
+        if m:
+            out.append((m.group(1), int(m.group(2))))
+    return out
+
+
+def _extract_excel_row_from_context(key_context: str) -> str:
+    """
+    Extract excel row number from key_context patterns like:
+    - excel_row=8
+    - plan_cell=R8
+    - row=39
+    - rows=56,57,58
+    """
+    if not key_context:
+        return ""
+    s = str(key_context)
+    # excel_row=N
+    m = re.search(r"excel_row\s*=\s*(\d+)", s)
+    if m:
+        return m.group(1)
+    # plan_cell=R8 or plan_cell=S12
+    m = re.search(r"plan_cell\s*=\s*[A-Z]{1,3}(\d+)", s)
+    if m:
+        return m.group(1)
+    # rows=56,57,58 (multiple rows)
+    m = re.search(r"\brows\s*=\s*([\d,]+)", s)
+    if m:
+        return m.group(1)
+    # row=39
+    m = re.search(r"\brow\s*=\s*(\d+)", s)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_col_letter_from_context(key_context: str) -> str:
+    """
+    Extract column letter from key_context patterns like plan_cell=R8.
+    """
+    if not key_context:
+        return ""
+    s = str(key_context)
+    m = re.search(r"plan_cell\s*=\s*([A-Z]{1,3})\d+", s)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _is_excel_letter(s: str) -> bool:
+    """Check if a string is a pure Excel column letter like R, S, M, AE."""
+    return bool(re.fullmatch(r"[A-Z]{1,3}", s.strip()))
+
 
 def _extract_check_id(rule_id: str) -> str:
     """
@@ -170,6 +250,24 @@ def format_all_checks_for_export(all_checks: pd.DataFrame) -> pd.DataFrame:
     mask12 = df["מזהה בדיקה"].eq("R_12")
     df.loc[mask12, "רמת בדיקה"] = df.loc[mask12, "key_context"].apply(_extract_checked_cols_from_key_context)
 
+    # ✅ OVERRIDE לרול 14: רמת בדיקה = שלב ההחלטה (keyword/fuzzy/llm/fail_llm/no_decision)
+    mask14 = df["מזהה בדיקה"].eq("R_14")
+    if mask14.any() and "method" in df.columns:
+        _R14_METHOD_MAP = {
+            "keyword": "keyword",
+            "fuzzy": "fuzzy",
+            "llm": "llm",
+            "prior": "fuzzy",       # prior is a deterministic/statistical stage
+            "fail_llm": "fail_llm",
+            "no_decision": "no_decision",
+            "none": "no_decision",  # legacy fallback
+        }
+        df.loc[mask14, "רמת בדיקה"] = (
+            df.loc[mask14, "method"]
+            .map(_R14_METHOD_MAP)
+            .fillna("no_decision")
+        )
+
     df["פירוט הבדיקה"] = df["מזהה בדיקה"].map(RULE_DETAILS).fillna("")
     
     # rename to Hebrew
@@ -187,6 +285,71 @@ def format_all_checks_for_export(all_checks: pd.DataFrame) -> pd.DataFrame:
     conf = pd.to_numeric(df.get("ביטחון", pd.Series([None]*len(df))), errors="coerce")
     mask_low = df["סטטוס"].eq("נכשל") & conf.notna() & (conf < 0.50)
     df.loc[mask_low, "סטטוס"] = "נכשל (ביטחון נמוך)"
+
+    # --- Build "שורה באקסל" and enrich "עמודה באקסל" with column letter ---
+    # Access raw columns before rename (excel_cells, key_context, row_index)
+    # Note: after rename, column_name → "עמודה באקסל", key_context → "בדיקה שבוצעה"
+    excel_cells_col = "excel_cells" if "excel_cells" in df.columns else None
+    key_ctx_col = "בדיקה שבוצעה"  # renamed from key_context
+    col_name_col = "עמודה באקסל"   # renamed from column_name
+    row_idx_col = "row_index" if "row_index" in df.columns else None
+
+    excel_rows = []
+    enriched_col_names = []
+
+    for i in range(len(df)):
+        row_num = ""
+        col_letter = ""
+
+        # 1. Try to extract from excel_cells
+        raw_cells = df.iloc[i][excel_cells_col] if excel_cells_col else None
+        parsed = _parse_excel_cells(raw_cells)
+        if parsed:
+            # Use first cell reference
+            col_letter = parsed[0][0]
+            row_num = str(parsed[0][1])
+
+        # 2. Fallback: extract from key_context (now renamed to בדיקה שבוצעה)
+        if not row_num:
+            kc = str(df.iloc[i].get(key_ctx_col, "") or "")
+            row_num = _extract_excel_row_from_context(kc)
+            if not col_letter:
+                col_letter = _extract_col_letter_from_context(kc)
+
+        # 3. Fallback for row: compute from row_index for report sheet rules
+        if not row_num and row_idx_col:
+            ri = df.iloc[i].get(row_idx_col)
+            sheet_name = str(df.iloc[i].get("לשונית באקסל", "") or "")
+            if ri is not None and str(ri).strip() not in {"", "nan", "None"}:
+                try:
+                    ri_int = int(float(ri))
+                    # Report sheet: excel_row = row_index + header_row + 2 = row_index + 8
+                    if "דיווח" in sheet_name:
+                        row_num = str(ri_int + 8)
+                except (ValueError, TypeError):
+                    pass
+
+        excel_rows.append(row_num)
+
+        # Enrich column name with letter
+        cur_col = str(df.iloc[i].get(col_name_col, "") or "").strip()
+        if col_letter and cur_col:
+            # If column_name is already a pure letter (e.g., "R", "AE"), keep as-is
+            # Check if ANY part is already a letter (for multi-column like "R / S")
+            parts = [p.strip() for p in cur_col.split("/")]
+            all_letters = all(_is_excel_letter(p) for p in parts if p)
+            if not all_letters:
+                # Only add letter if column_name is not already the letter
+                if col_letter not in cur_col:
+                    cur_col = f"{cur_col}({col_letter})"
+        elif not col_letter and cur_col:
+            # For multi-column values like "H / I / J / K / L / M", letters are already there
+            pass
+
+        enriched_col_names.append(cur_col)
+
+    df["שורה באקסל"] = excel_rows
+    df["עמודה באקסל"] = enriched_col_names
 
     # ensure columns exist
     for c in FINAL_COLS:
@@ -467,9 +630,9 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
             "מיקום הבדיקה": _location_from_group(gdf),
             "ממצאים": f"{check_id}: {fail}/{total} FAIL",
             "סטטוס": _status_rollup(fail, total),
-            "הערות": "שדה ריק למילוי המשתמש",
-            "הערת משתמש": "שדה ריק למילוי המשתמש",
-            "פעולה נדרשת מול התאגיד": "שדה ריק למילוי המשתמש",
+            "הערות": "",
+            "הערת משתמש":  "",
+            "פעולה נדרשת מול התאגיד": "",
         })
 
     out = pd.DataFrame(rows_out)

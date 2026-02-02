@@ -1086,6 +1086,18 @@ def check_014_llm_project_funding_classification(
             )
         ]
 
+    # Excel cell mapping for row/column tracking
+    from openpyxl.utils import get_column_letter as _get_col_letter
+    _col_to_letter = {col: _get_col_letter(i + 1) for i, col in enumerate(report_df.columns)}
+    _header_row = getattr(cfg, "report_header_row", 6)
+    _excel_row_offset = _header_row + 2  # same convention as R12
+
+    def _r14_cell_ref(df_i: int, col_name: str) -> Optional[str]:
+        letter = _col_to_letter.get(col_name)
+        if not letter:
+            return None
+        return f"{sheet}!{letter}{int(df_i + _excel_row_offset)}"
+
     # Row filtering setup
     id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
     id_col = col_map.get(id_norm)
@@ -1323,6 +1335,7 @@ def check_014_llm_project_funding_classification(
         method = None
         confidence = 0.0
         candidate_allowed_set = None
+        llm_was_attempted = False  # Track if LLM was actually called
 
         # Stage A: Keyword
         kw_label, kw_conf = _predict_by_keyword(pn)
@@ -1349,6 +1362,10 @@ def check_014_llm_project_funding_classification(
         # Stage C: LLM (only if keyword + fuzzy failed)
         if predicted is None:
             print(f"[R_14 DEBUG]   -> Entering LLM stage (keyword+fuzzy failed)")
+            # Check if LLM will actually be called (allowed_set matches and keys present)
+            target_set = {"שיקום/שדרוג", "פיתוח"}
+            if candidate_allowed_set == target_set:
+                llm_was_attempted = True
             llm_label, llm_conf = _predict_by_llm(project_name, candidate_allowed_set)
             if llm_label is not None:
                 predicted = canonicalize_label(llm_label)
@@ -1417,6 +1434,8 @@ def check_014_llm_project_funding_classification(
                     "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
                     "סיווג סופי: לא זמין"
                 )
+            # Determine method for "רמת בדיקה" column
+            no_decision_method = "fail_llm" if llm_was_attempted else "no_decision"
             results.append(
                 CheckResult(
                     rule_id=rule_id,
@@ -1431,7 +1450,7 @@ def check_014_llm_project_funding_classification(
                     expected_value="(לא ניתן לחזות)",
                     key_context=f"project_name={project_name}",
                     confidence=0.0,
-                    method="none",
+                    method=no_decision_method,
                 )
             )
             continue
@@ -1614,6 +1633,13 @@ def check_014_llm_project_funding_classification(
                         method=method,
                     )
                 )
+
+    # Post-process: add excel_cells to all R14 results for row/column tracking
+    for r in results:
+        if r.row_index is not None and r.excel_cells is None:
+            ref = _r14_cell_ref(r.row_index, class_col)
+            if ref:
+                r.excel_cells = [ref]
 
     return results
 
