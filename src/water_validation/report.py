@@ -375,9 +375,10 @@ def build_executive_summary(all_checks_df: pd.DataFrame) -> pd.DataFrame:
           .reset_index(name="count")
     )
 
-    # Total FAILS
+    # Total FAILS (support both English "Fail" and Hebrew "נכשל")
+    fail_mask = df["status"].isin(["Fail", "נכשל"])
     fails = (
-        df[df["status"] == "Fail"]
+        df[fail_mask]
         .groupby(["utility_name", "plan_file"])
         .size()
         .reset_index(name="total_fails")
@@ -385,7 +386,7 @@ def build_executive_summary(all_checks_df: pd.DataFrame) -> pd.DataFrame:
 
     # Top failing rules (optional but helpful)
     top_rules = (
-        df[df["status"] == "Fail"]
+        df[fail_mask]
         .groupby(["utility_name", "plan_file", "rule_id", "rule_name"])
         .size()
         .reset_index(name="fail_count")
@@ -401,7 +402,7 @@ def build_executive_summary(all_checks_df: pd.DataFrame) -> pd.DataFrame:
         df.groupby(["utility_name", "plan_file"])
           .agg(
               total_checks=("rule_id", "count"),
-              critical_fails=("severity", lambda s: ((df.loc[s.index, "severity"] == "Critical") & (df.loc[s.index, "status"] == "Fail")).sum()),
+              critical_fails=("severity", lambda s: ((df.loc[s.index, "severity"] == "Critical") & (df.loc[s.index, "status"].isin(["Fail", "נכשל"]))).sum()),
           )
           .reset_index()
     )
@@ -507,7 +508,8 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
         return ""
 
     def _status_is_fail(v: object) -> bool:
-        return str(v).strip().lower() == "fail"
+        s = str(v).strip().lower()
+        return s in ("fail", "נכשל")
 
     # Same KPI logic as the CLI printing logic
     def _kpi_counts(gdf: pd.DataFrame) -> tuple[int, int]:
