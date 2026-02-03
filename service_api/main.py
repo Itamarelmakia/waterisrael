@@ -161,6 +161,91 @@ def _build_summary_rows(summary_table_df: pd.DataFrame) -> List[Dict[str, Any]]:
     return df[needed].to_dict(orient="records")
 
 
+def _is_fail(status) -> bool:
+    s = str(status).strip().lower()
+    return s in ("fail", "נכשל")
+
+
+def _build_insights_by_check(all_checks_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Per-check failure breakdown: check_id, name, total, fail, pct."""
+    import re
+    df = all_checks_df.copy()
+    if "rule_id" not in df.columns or "status" not in df.columns:
+        return []
+
+    def _short_id(rid):
+        s = str(rid).strip()
+        if not s.startswith("R_"):
+            return s
+        parts = [p.strip() for p in s.split("_") if p.strip()]
+        if len(parts) < 2 or not parts[1].isdigit():
+            return s
+        first = int(parts[1])
+        if len(parts) >= 3 and parts[2].isdigit():
+            return f"R_{first}_{int(parts[2])}"
+        return f"R_{first}"
+
+    df["check_id"] = df["rule_id"].apply(_short_id)
+    df = df[df["check_id"].astype(str).str.strip().ne("")]
+
+    rows = []
+    for check_id, gdf in df.groupby("check_id"):
+        total = len(gdf)
+        fail = sum(1 for s in gdf["status"] if _is_fail(s))
+        name = ""
+        if "rule_name" in gdf.columns:
+            names = gdf["rule_name"].dropna().tolist()
+            name = str(names[0]).strip() if names else ""
+        rows.append({
+            "check_id": str(check_id),
+            "name": name,
+            "total": total,
+            "fail": fail,
+            "pct": round(fail / total * 100, 1) if total > 0 else 0,
+        })
+
+    rows.sort(key=lambda r: (-r["pct"], -r["fail"]))
+    return rows
+
+
+def _build_insights_by_row(all_checks_df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """Per-row failure breakdown: row_index (Excel), total checks, fail checks, pct."""
+    df = all_checks_df.copy()
+    if "row_index" not in df.columns or "status" not in df.columns:
+        return []
+
+    # Filter rows that have a real row_index
+    df = df[df["row_index"].notna()].copy()
+    df = df[df["row_index"].astype(str).str.strip().apply(lambda x: x.lower() not in ("", "nan", "none"))]
+    if df.empty:
+        return []
+
+    df["row_int"] = df["row_index"].apply(lambda x: int(float(x)))
+
+    # Compute excel row (report sheet offset +8)
+    def _excel_row(row):
+        sheet = str(row.get("sheet_name", "") or "")
+        if "דיווח" in sheet:
+            return row["row_int"] + 8
+        return row["row_int"]
+
+    df["excel_row"] = df.apply(_excel_row, axis=1)
+
+    rows = []
+    for excel_row, gdf in df.groupby("excel_row"):
+        total = len(gdf)
+        fail = sum(1 for s in gdf["status"] if _is_fail(s))
+        rows.append({
+            "excel_row": int(excel_row),
+            "total": total,
+            "fail": fail,
+            "pct": round(fail / total * 100, 1) if total > 0 else 0,
+        })
+
+    rows.sort(key=lambda r: (-r["pct"], -r["fail"]))
+    return rows
+
+
 @app.post("/validate")
 async def validate_json(file: UploadFile = File(...)):
     in_path = _save_upload_to_tmp(file)
@@ -169,8 +254,14 @@ async def validate_json(file: UploadFile = File(...)):
         all_checks_df, summary_table_df, exec_tuple = _run_validation(in_path)
 
         summary_rows = _build_summary_rows(summary_table_df)
+        insights_by_check = _build_insights_by_check(all_checks_df)
+        insights_by_row = _build_insights_by_row(all_checks_df)
 
-        return JSONResponse(content={"summary_rows": summary_rows})
+        return JSONResponse(content={
+            "summary_rows": summary_rows,
+            "insights_by_check": insights_by_check,
+            "insights_by_row": insights_by_row,
+        })
 
     except HTTPException:
         raise

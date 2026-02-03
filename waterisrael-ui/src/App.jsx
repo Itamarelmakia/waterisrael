@@ -1,5 +1,5 @@
 import React, { useMemo, useRef, useState } from "react";
-import { Upload, FileSpreadsheet, X, Loader2, ChevronDown, ChevronLeft, Download, FileText } from "lucide-react";
+import { Upload, FileSpreadsheet, X, Loader2, ChevronDown, ChevronLeft, Download, FileText, BarChart3, Rows3 } from "lucide-react";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "https://waterisrael-api.onrender.com";
 
@@ -42,7 +42,11 @@ async function validateExcel(file) {
   }
 
   const rows = Array.isArray(json?.summary_rows) ? json.summary_rows : [];
-  return rows.map(normalizeRow);
+  return {
+    rows: rows.map(normalizeRow),
+    insightsByCheck: Array.isArray(json?.insights_by_check) ? json.insights_by_check : [],
+    insightsByRow: Array.isArray(json?.insights_by_row) ? json.insights_by_row : [],
+  };
 }
 
 async function fetchExecutiveSummary(file) {
@@ -85,6 +89,30 @@ async function downloadValidationExcel(file) {
   URL.revokeObjectURL(url);
 }
 
+function HorizontalBar({ label, sublabel, pct, fail, total }) {
+  const barColor = pct >= 50 ? "#ef4444" : pct >= 20 ? "#f59e0b" : "#22c55e";
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 3 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: "#1e293b" }}>{label}</div>
+        <div style={{ fontSize: 12, color: "#64748b" }}>
+          {sublabel ? <span style={{ marginLeft: 8 }}>{sublabel}</span> : null}
+          <span style={{ fontWeight: 700, color: barColor }}> {fail}/{total} ({pct}%)</span>
+        </div>
+      </div>
+      <div style={{ height: 18, background: "#f1f5f9", borderRadius: 9, overflow: "hidden", position: "relative" }}>
+        <div style={{
+          height: "100%",
+          width: `${Math.max(pct, 1.5)}%`,
+          background: barColor,
+          borderRadius: 9,
+          transition: "width 0.4s ease",
+        }} />
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [validationResults, setValidationResults] = useState([]);
@@ -95,6 +123,9 @@ export default function App() {
   const [execSummaries, setExecSummaries] = useState(null);
   const [isLoadingSummary, setIsLoadingSummary] = useState(false);
   const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [insightsByCheck, setInsightsByCheck] = useState([]);
+  const [insightsByRow, setInsightsByRow] = useState([]);
+  const [activeInsight, setActiveInsight] = useState(null); // "check" | "row" | null
 
   const fileInputRef = useRef(null);
 
@@ -112,6 +143,9 @@ export default function App() {
     setExpandedRows(new Set());
     setExecSummaries(null);
     setShowSummaryModal(false);
+    setInsightsByCheck([]);
+    setInsightsByRow([]);
+    setActiveInsight(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -156,8 +190,10 @@ export default function App() {
     setHasResults(false);
 
     try {
-      const rows = await validateExcel(selectedFile);
-      setValidationResults(rows);
+      const result = await validateExcel(selectedFile);
+      setValidationResults(result.rows);
+      setInsightsByCheck(result.insightsByCheck);
+      setInsightsByRow(result.insightsByRow);
       setHasResults(true);
     } catch (err) {
       setValidationResults([
@@ -170,6 +206,8 @@ export default function App() {
           required_action: "",
         },
       ]);
+      setInsightsByCheck([]);
+      setInsightsByRow([]);
       setHasResults(true);
     } finally {
       setIsValidating(false);
@@ -361,6 +399,81 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+          </div>
+        )}
+
+        {hasResults && (insightsByCheck.length > 0 || insightsByRow.length > 0) && (
+          <div style={{ margin: "18px 0" }}>
+            <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+              <button
+                onClick={() => setActiveInsight(activeInsight === "check" ? null : "check")}
+                style={{
+                  ...styles.secondaryBtn,
+                  ...(activeInsight === "check" ? { background: "#0f172a", color: "white", borderColor: "#0f172a" } : {}),
+                  padding: "10px 16px",
+                  fontSize: 14,
+                }}
+              >
+                <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                  <BarChart3 size={16} />
+                  ממצאים לפי בדיקה
+                </span>
+              </button>
+              <button
+                onClick={() => setActiveInsight(activeInsight === "row" ? null : "row")}
+                style={{
+                  ...styles.secondaryBtn,
+                  ...(activeInsight === "row" ? { background: "#0f172a", color: "white", borderColor: "#0f172a" } : {}),
+                  padding: "10px 16px",
+                  fontSize: 14,
+                }}
+              >
+                <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+                  <Rows3 size={16} />
+                  ממצאים לפי שורה
+                </span>
+              </button>
+            </div>
+
+            {activeInsight === "check" && insightsByCheck.length > 0 && (
+              <div style={styles.card}>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "#0f172a", marginBottom: 16 }}>
+                  % כשלון לפי בדיקה
+                </div>
+                {insightsByCheck.map((c) => (
+                  <HorizontalBar
+                    key={c.check_id}
+                    label={`${c.check_id}`}
+                    sublabel={c.name}
+                    pct={c.pct}
+                    fail={c.fail}
+                    total={c.total}
+                  />
+                ))}
+              </div>
+            )}
+
+            {activeInsight === "row" && insightsByRow.length > 0 && (
+              <div style={styles.card}>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "#0f172a", marginBottom: 16 }}>
+                  % כשלון לפי שורה באקסל
+                </div>
+                {insightsByRow.slice(0, 50).map((r) => (
+                  <HorizontalBar
+                    key={r.excel_row}
+                    label={`שורה ${r.excel_row}`}
+                    pct={r.pct}
+                    fail={r.fail}
+                    total={r.total}
+                  />
+                ))}
+                {insightsByRow.length > 50 && (
+                  <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 8, textAlign: "center" }}>
+                    מציג 50 שורות מתוך {insightsByRow.length}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
