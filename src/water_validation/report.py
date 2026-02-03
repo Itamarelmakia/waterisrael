@@ -705,127 +705,49 @@ def build_executive_summary_prompt(
     plan_file: str,
 ) -> str:
     """
-    Build a Hebrew LLM prompt for generating an executive summary
-    from the validation results of a single file.
+    Build a compact Hebrew LLM prompt for executive summary.
+    Minimises token usage by sending only aggregated stats.
     """
     df = file_checks_df.copy()
 
-    # --- Counts ---
     fail_mask = df["status"].isin(["Fail", "נכשל"])
-    pass_mask = df["status"].isin(["Pass", "עבר"])
-    info_mask = df["status"].isin(["לא ידוע", "Info", "לא רלוונטי", "Not applicable"])
-
     total = len(df)
     fail_count = int(fail_mask.sum())
-    pass_count = int(pass_mask.sum())
-    info_count = int(info_mask.sum())
+    pass_count = int(df["status"].isin(["Pass", "עבר"]).sum())
+    info_count = total - fail_count - pass_count
 
-    # --- Year ---
     year = _extract_year_from_filename(plan_file)
-    year_range = f"{year}-{int(year)+4}" if year else "לא ידוע"
+    yr = f"{year}-{int(year)+4}" if year else "?"
 
-    # --- Unique checks and rows ---
-    unique_rules = df["rule_id"].nunique() if "rule_id" in df.columns else 0
-    unique_rows = 0
-    if "row_index" in df.columns:
-        row_vals = df["row_index"].dropna()
-        row_vals = [int(float(x)) for x in row_vals if str(x).strip().lower() not in ("", "nan", "none")]
-        unique_rows = len(set(row_vals))
+    # Top 5 failing rules (compact: "R_1:4, R_12:3, ...")
+    top_fails = ""
+    if fail_count > 0 and "rule_id" in df.columns:
+        fc = df[fail_mask].groupby("rule_id").size().sort_values(ascending=False).head(5)
+        top_fails = ", ".join(f"{_extract_check_id(r)}:{c}" for r, c in fc.items())
 
-    # --- R_5 row (סה"כ נתוני תוכנית השקעה) ---
-    r5_info = ""
-    r5_mask = df["rule_id"].str.startswith("R_5") if "rule_id" in df.columns else pd.Series([False]*len(df))
-    if r5_mask.any():
-        r5_rows = df[r5_mask]
-        r5_statuses = r5_rows["status"].tolist()
-        r5_fail = sum(1 for s in r5_statuses if str(s).strip().lower() in ("fail", "נכשל"))
-        r5_total = len(r5_statuses)
-        r5_info = f"R_5 (סה\"כ נתוני תוכנית השקעה): {r5_fail}/{r5_total} כשלונות"
-        # Add actual values if available
-        if "actual_value" in df.columns:
-            vals = [str(v).strip() for v in r5_rows["actual_value"].dropna().tolist() if str(v).strip() not in ("", "nan")]
-            if vals:
-                r5_info += f"\n  ערכים: {', '.join(vals[:5])}"
+    # R_24 short pipes summary (one line)
+    r24 = ""
+    if "rule_id" in df.columns:
+        r24m = df["rule_id"].str.startswith("R_24")
+        if r24m.any():
+            r24f = int(df.loc[r24m & fail_mask].shape[0])
+            r24t = int(r24m.sum())
+            r24 = f"R_24 פרויקטים קטנים: {r24f}/{r24t} כשלונות"
 
-    # --- R_24 (short pipe projects) ---
-    r24_info = ""
-    r24_mask = df["rule_id"].str.startswith("R_24") if "rule_id" in df.columns else pd.Series([False]*len(df))
-    if r24_mask.any():
-        r24_rows = df[r24_mask]
-        r24_fail = sum(1 for s in r24_rows["status"].tolist() if str(s).strip().lower() in ("fail", "נכשל"))
-        r24_total = len(r24_rows)
-        r24_info = f"R_24 (פרויקטים קטנים - אורך צנרת < 100): {r24_fail}/{r24_total} כשלונות"
-        if "message" in df.columns:
-            msgs = [str(m).strip() for m in r24_rows["message"].dropna().tolist() if str(m).strip() not in ("", "nan")]
-            if msgs:
-                r24_info += f"\n  {msgs[0][:200]}"
-
-    # --- Failed rules breakdown ---
-    failed_rules_text = ""
-    if fail_count > 0:
-        fail_df = df[fail_mask]
-        if "rule_id" in fail_df.columns and "rule_name" in fail_df.columns:
-            rule_counts = (
-                fail_df.groupby(["rule_id", "rule_name"])
-                .size()
-                .reset_index(name="count")
-                .sort_values("count", ascending=False)
-            )
-            lines = []
-            for _, row in rule_counts.iterrows():
-                check_id = _extract_check_id(str(row["rule_id"]))
-                detail = RULE_DETAILS.get(check_id, "")
-                lines.append(f"- {check_id} ({row['rule_name']}): {row['count']} כשלונות")
-                if detail:
-                    lines.append(f"  פירוט: {detail[:150]}")
-            failed_rules_text = "\n".join(lines)
-
-    # --- Build prompt ---
-    prompt_lines = [
-        "אתה בודק מקצועי של תוכניות השקעה של תאגידי מים וביוב בישראל.",
-        "כתוב תקציר מנהלים בעברית על סמך תוצאות הבדיקה הבאות.",
-        "",
-        f"שם תאגיד: {utility_name}",
-        f"שם קובץ: {Path(plan_file).stem}",
-        f"לגבי שנים: {year_range}",
-        "",
-        "נתוני הבדיקה:",
-        f"- סה\"כ בדיקות: {total} ({unique_rows} שורות × {unique_rules} סוגי בדיקות)",
-        f"- עברו: {pass_count}",
-        f"- נכשלו: {fail_count}",
-        f"- דורשות בירור / לא רלוונטי: {info_count}",
-        "",
-    ]
-
-    if r5_info:
-        prompt_lines.append("ערכים שהוגדרו \"סה\"כ נתוני תוכנית השקעה\" (שורה 5 בנספח הבדיקות):")
-        prompt_lines.append(r5_info)
-        prompt_lines.append("")
-
-    if r24_info:
-        prompt_lines.append("התייחסות לפרויקטים קטנים - בדיקת אורך (שורה 25):")
-        prompt_lines.append(r24_info)
-        prompt_lines.append("")
-
-    if failed_rules_text:
-        prompt_lines.append("פירוט בדיקות שנכשלו:")
-        prompt_lines.append(failed_rules_text)
-        prompt_lines.append("")
-
-    prompt_lines.extend([
-        "התקציר צריך לכלול:",
-        "1. שם תאגיד, ותאריך הגשה, לגבי שנים",
-        "2. מספר בדיקות שנעשו (שורות × בדיקות)",
-        "3. מספר בדיקות שעברו, נכשלו, או דורשות בירור",
-        "4. ציון ערכים שהוגדרו \"סה\"כ נתוני תוכנית השקעה\"",
-        "5. התייחסות לפרויקטים קטנים - בדיקת אורך",
-        "6. דפוסים שחוזרים על עצמם (לדוגמה ריבוי חריגות בקטרים או שדות ריקים)",
-        "7. המלצות מקצועיות להמשך הטיפול בתאגיד",
-        "",
-        "כתוב בצורה מקצועית ותמציתית. אל תמציא נתונים - השתמש רק במידע שסופק.",
-    ])
-
-    return "\n".join(prompt_lines)
+    prompt = (
+        f"כתוב תקציר מנהלים קצר (עד 150 מילים) בעברית.\n"
+        f"תאגיד: {utility_name}, שנים: {yr}\n"
+        f"בדיקות: {total} (עברו:{pass_count} נכשלו:{fail_count} אחר:{info_count})\n"
+    )
+    if top_fails:
+        prompt += f"בדיקות עם הכי הרבה כשלונות: {top_fails}\n"
+    if r24:
+        prompt += f"{r24}\n"
+    prompt += (
+        "כלול: סיכום מצב, דפוסים חוזרים, המלצות מקצועיות.\n"
+        "אל תמציא נתונים."
+    )
+    return prompt
 
 
 def generate_executive_summaries(
