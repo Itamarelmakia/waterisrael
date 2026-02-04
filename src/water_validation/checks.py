@@ -582,7 +582,7 @@ def check_012_project_fields_not_empty(
     # Excel row number: header_row=6 => header is Excel row 7.
     # DataFrame index 0 corresponds to Excel row 8.
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = (header_row + 2)  # +1 for 1-based Excel, +1 because first data row is after header
+    excel_row_offset = (header_row + 3)  # header_row(6) + 1 (1-based) + 1 (header) + 1 (sub-header) = row 9 for df_idx 0
 
 
     from openpyxl.utils import get_column_letter
@@ -1090,7 +1090,7 @@ def check_014_llm_project_funding_classification(
     from openpyxl.utils import get_column_letter as _get_col_letter
     _col_to_letter = {col: _get_col_letter(i + 1) for i, col in enumerate(report_df.columns)}
     _header_row = getattr(cfg, "report_header_row", 6)
-    _excel_row_offset = _header_row + 2  # same convention as R12
+    _excel_row_offset = _header_row + 3  # same convention as R12
 
     def _r14_cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = _col_to_letter.get(col_name)
@@ -1992,7 +1992,7 @@ def check_018_facility_rehab_upgrade(
     col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
 
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = header_row + 2  # same convention as R12
+    excel_row_offset = header_row + 3  # same convention as R12
 
     def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = col_to_excel_letter.get(col_name)
@@ -2338,7 +2338,7 @@ def check_019_total_planned_cost_per_project(
     # Excel highlighting mapping
     col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = header_row + 2  # same as R12/R18
+    excel_row_offset = header_row + 3  # same as R12/R18
 
     def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = col_to_excel_letter.get(col_name)
@@ -2548,7 +2548,7 @@ def check_020_project_status_planning_report(
     # Excel highlighting mapping
     col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = header_row + 2  # same as R12/R18/R19
+    excel_row_offset = header_row + 3  # same as R12/R18/R19
 
     def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = col_to_excel_letter.get(col_name)
@@ -2612,6 +2612,781 @@ def check_020_project_status_planning_report(
                 expected_value="מכיל ערך",
                 confidence=1.0,
                 method="NotEmpty",
+                excel_cells=excel_cells,
+                message=msg,
+            )
+        )
+
+    return results
+
+
+# =============================================================================
+# R_21 — קפיצת קוטר – בדיקת שורה תואמת (Step 1)
+# =============================================================================
+
+# Authoritative diameter table (ordered ascending)
+_GRADE_INCH = [4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 30, 32, 36, 40, 42, 46, 48, 54, 60, 64]
+_GRADE_MM = [100, 160, 200, 250, 315, 355, 400, 450, 500, 630, 710, 750, 800, 914, 1000, 1050, 1150, 1200, 1350, 1500, 1600]
+
+_GRADE_INCH_IDX = {v: i for i, v in enumerate(_GRADE_INCH)}
+_GRADE_MM_IDX = {v: i for i, v in enumerate(_GRADE_MM)}
+
+
+def _normalize_to_nearest(value: int, allowed: list) -> int:
+    """Snap *value* to the closest entry in *allowed*.
+
+    Tie-break (equal distance to two neighbours): choose the **larger** value.
+    Examples (mm list):  225 → 250,  224 → 200,  226 → 250.
+    """
+    best = allowed[0]
+    best_dist = abs(value - best)
+    for v in allowed[1:]:
+        d = abs(value - v)
+        if d < best_dist or (d == best_dist and v > best):
+            best = v
+            best_dist = d
+    return best
+
+
+def check_021_diameter_jump_matching_row(
+    report_df: pd.DataFrame,
+    cfg: PlanConfig,
+) -> List[CheckResult]:
+    """
+    R_21 — קפיצת קוטר: בדיקת שורה תואמת + בדיקת יחס עלות
+
+    For rows where F == "שיקום ושדרוג":
+      Step 1: Parse colon-separated diameters in I (old) and L (new),
+              detect unit, look up grade indices. If any pair jumps > 1
+              grade step, search for a matching row with same C,D,E and
+              F in ("פיתוח", "שדרוג"). FAIL if no match.
+      Step 2: When matching row found, verify cost split (AE column)
+              matches expected split from diameter ratios.
+              rehab_share = (old_d/new_d)^1.2, weighted by segment lengths.
+              PASS if within 5% tolerance.
+    """
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    RULE_ID = "R_21"
+    RULE_NAME = "קפיצת קוטר – בדיקת שורה תואמת + יחס עלות"
+    SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
+
+    cols = list(report_df.columns)
+
+    # ---- local helpers ----
+
+    def _is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
+
+    def _to_number(v: object) -> Optional[float]:
+        if _is_empty(v):
+            return None
+        try:
+            s = str(v).strip().replace(",", "").replace('"', '')
+            return float(s)
+        except Exception:
+            return None
+
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
+
+    def _norm_col(c: object) -> str:
+        s = str(c) if c is not None else ""
+        s = re.sub(r"\s*Unnamed:.*", "", s)
+        s = re.sub(r"_level_\d+", "", s)
+        s = s.replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    # ---- resolve columns ----
+    col_c = _col_by_excel_letter("C")   # ישוב
+    col_d = _col_by_excel_letter("D")   # שם פרויקט
+    col_e = _col_by_excel_letter("E")   # רחוב/שכונה
+    col_f = _col_by_excel_letter("F")   # סיווג פרויקט
+    col_i = _col_by_excel_letter("I")   # קוטר קיים
+    col_j = _col_by_excel_letter("J")   # אורך לפי קוטר קיים (colon-separated)
+    col_l = _col_by_excel_letter("L")   # קוטר מתוכנן
+    col_m = _col_by_excel_letter("M")   # אורך לפי קוטר מתוכנן (colon-separated)
+    col_ae = _col_by_excel_letter("AE") # אומדן פרויקט
+
+    missing = []
+    for ltr, c in [("C", col_c), ("D", col_d), ("E", col_e),
+                    ("F", col_f), ("I", col_i), ("L", col_l)]:
+        if c is None:
+            missing.append(ltr)
+
+    if missing:
+        return [
+            CheckResult(
+                rule_id=f"{RULE_ID}_מבנה עמודות",
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name=None,
+                key_context="columns_presence",
+                actual_value=list(report_df.columns),
+                expected_value=["C", "D", "E", "F", "I", "L"],
+                message=f"Missing required columns: {missing}",
+            )
+        ]
+
+    # ---- project-id for real-row detection ----
+    norm_to_orig: dict = {}
+    for c in cols:
+        n = _norm_col(c)
+        if n and n not in norm_to_orig:
+            norm_to_orig[n] = c
+
+    id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
+    id_col = norm_to_orig.get(id_norm)
+
+    def _is_real_row(df_i: int) -> bool:
+        if id_col is None:
+            return True
+        v = report_df.at[df_i, id_col]
+        if _is_empty(v):
+            return False
+        s = str(v).strip()
+        return s not in {"-", ""} and s.lower() != "nan"
+
+    # ---- excel cell refs ----
+    col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
+    header_row = getattr(cfg, "report_header_row", 6)
+    excel_row_offset = header_row + 3
+
+    def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
+        letter = col_to_excel_letter.get(col_name)
+        if not letter:
+            return None
+        return f"{SHEET}!{letter}{int(df_i + excel_row_offset)}"
+
+    # ---- diameter parsing helpers ----
+
+    def _parse_colon_list(raw) -> List[str]:
+        """Split colon-separated diameter string into tokens."""
+        s = str(raw).strip()
+        tokens = [t.strip() for t in s.split(":") if t.strip()]
+        return tokens
+
+    def _detect_unit(tokens: List[str]) -> Optional[str]:
+        """Detect unit: 'inch' or 'mm'. Returns None if ambiguous."""
+        has_quote = any('"' in str(t) for t in tokens)
+        if has_quote:
+            return "inch"
+
+        nums = []
+        for t in tokens:
+            n = _to_number(t)
+            if n is not None and n > 0:
+                nums.append(n)
+
+        if not nums:
+            return None
+
+        max_val = max(nums)
+        if max_val <= 64:
+            return "inch"
+        if max_val >= 80:
+            return "mm"
+        return None  # ambiguous
+
+    def _grade_index(val_num: float, unit: str) -> Optional[int]:
+        """Look up grade index for a numeric diameter value (after normalization)."""
+        allowed = _GRADE_INCH if unit == "inch" else _GRADE_MM
+        idx_map = _GRADE_INCH_IDX if unit == "inch" else _GRADE_MM_IDX
+        norm = _normalize_to_nearest(int(round(val_num)), allowed)
+        return idx_map.get(norm)
+
+    def _normalize_diam(val_num: float, unit: str) -> int:
+        """Normalize a raw diameter to the nearest standard value."""
+        allowed = _GRADE_INCH if unit == "inch" else _GRADE_MM
+        return _normalize_to_nearest(int(round(val_num)), allowed)
+
+    def _normalize_for_match(v) -> str:
+        """Normalize a cell value for row matching (C, D, E)."""
+        s = str(v).strip() if not _is_empty(v) else ""
+        s = re.sub(r"\s+", " ", s)
+        return s.lower()
+
+    # ---- Step 2 helpers ----
+
+    def _parse_num_list(raw, sep: str = ":") -> List[Optional[float]]:
+        """Parse colon-separated numeric list. Returns list of floats (None for unparseable)."""
+        if _is_empty(raw):
+            return []
+        tokens = [t.strip() for t in str(raw).strip().split(sep) if t.strip()]
+        result = []
+        for t in tokens:
+            n = _to_number(t)
+            result.append(n)
+        return result
+
+    def _parse_money_ae(raw) -> Optional[float]:
+        """Parse AE monetary value (may contain commas, currency symbols, etc.)."""
+        if _is_empty(raw):
+            return None
+        s = str(raw).strip()
+        s = re.sub(r"[₪,$€\s]", "", s)
+        s = s.replace(",", "")
+        try:
+            v = float(s)
+            return v if v > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    # Predefined rehab ratio table: (old_d, new_d) -> rehab share.
+    # Business-defined values; do NOT derive via formula.
+    # Stub: covers common inch jumps. Extend as authoritative data arrives.
+    _REHAB_RATIO_TABLE: Dict[Tuple[int, int], float] = {
+        (4, 8): 0.45,
+        (4, 10): 0.35,
+        (6, 10): 0.55,
+        (6, 12): 0.45,
+        (8, 12): 0.60,
+        (8, 14): 0.50,
+        (8, 16): 0.43,
+        (10, 14): 0.65,
+        (10, 16): 0.55,
+        (10, 18): 0.48,
+        (12, 16): 0.70,
+        (12, 18): 0.61,
+        (12, 20): 0.53,
+        (12, 24): 0.43,
+        (14, 20): 0.64,
+        (14, 24): 0.51,
+        (16, 24): 0.60,
+        (16, 28): 0.50,
+        (18, 24): 0.70,
+        (18, 28): 0.57,
+        (18, 30): 0.53,
+        (20, 28): 0.65,
+        (20, 30): 0.60,
+        (24, 32): 0.70,
+        (24, 36): 0.60,
+        (28, 36): 0.72,
+        (30, 40): 0.68,
+        (32, 42): 0.70,
+        (36, 48): 0.68,
+        (40, 54): 0.68,
+        # mm equivalents (common)
+        (100, 200): 0.43,
+        (100, 250): 0.35,
+        (160, 250): 0.58,
+        (160, 315): 0.45,
+        (200, 315): 0.58,
+        (200, 355): 0.50,
+        (200, 400): 0.43,
+        (250, 355): 0.65,
+        (250, 400): 0.55,
+        (250, 450): 0.48,
+        (300, 400): 0.70,
+        (315, 450): 0.63,
+        (315, 500): 0.55,
+        (355, 500): 0.64,
+        (400, 630): 0.55,
+        (400, 500): 0.75,
+        (450, 630): 0.64,
+        (500, 710): 0.63,
+        (500, 630): 0.75,
+        (630, 800): 0.75,
+        (630, 1000): 0.55,
+    }
+
+    def _get_rehab_ratio(old_d: float, new_d: float) -> Optional[float]:
+        """Look up predefined rehab ratio for (old_d -> new_d). Returns None if not in table."""
+        key = (int(round(old_d)), int(round(new_d)))
+        return _REHAB_RATIO_TABLE.get(key)
+
+    STEP2_TOLERANCE = 0.05  # 5 percentage points
+
+    # ---- main iteration ----
+    results: List[CheckResult] = []
+
+    for i in range(len(report_df)):
+        if not _is_real_row(i):
+            continue
+
+        excel_row = int(i + excel_row_offset)
+        pid = str(report_df.at[i, id_col]).strip() if id_col else f"row_{i}"
+
+        # Gate: F must be "שיקום ושדרוג" or "שיקום/שדרוג"
+        raw_f = str(report_df.at[i, col_f] or "").strip()
+        f_norm = normalize_text(raw_f)
+        if f_norm not in (normalize_text("שיקום ושדרוג"), normalize_text("שיקום/שדרוג")):
+            continue
+
+        # Gate: I and L must be non-empty
+        raw_i = report_df.at[i, col_i]
+        raw_l = report_df.at[i, col_l]
+        if _is_empty(raw_i) or _is_empty(raw_l):
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="I/L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={'(ריק)' if _is_empty(raw_i) else str(raw_i).strip()}, L={'(ריק)' if _is_empty(raw_l) else str(raw_l).strip()}",
+                    expected_value="I and L non-empty",
+                    message=f"דילוג: חסר קוטר בעמודות I/L | F={raw_f}",
+                    excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                )
+            )
+            continue
+
+        # Parse colon-separated lists
+        tokens_i = _parse_colon_list(raw_i)
+        tokens_l = _parse_colon_list(raw_l)
+
+        # Same length check
+        if len(tokens_i) != len(tokens_l):
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="I/L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={len(tokens_i)} tokens, L={len(tokens_l)} tokens",
+                    expected_value="same number of tokens",
+                    message=f"דילוג: אורך רשימות קוטר שונה (I:{len(tokens_i)}, L:{len(tokens_l)})",
+                    excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                )
+            )
+            continue
+
+        # Detect unit
+        all_tokens = tokens_i + tokens_l
+        unit = _detect_unit(all_tokens)
+        if unit is None:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="I/L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={str(raw_i).strip()}, L={str(raw_l).strip()}",
+                    expected_value="unit detection (inch or mm)",
+                    message="נכשל: לא ניתן לזהות יחידות קוטר (אינץ' או מ\"מ)",
+                    excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                )
+            )
+            continue
+
+        grade_table = _GRADE_INCH_IDX if unit == "inch" else _GRADE_MM_IDX
+
+        # Check each pair for jumps > 1 grade (using normalized diameters)
+        jumps = []       # (idx, norm_old, norm_new, delta)
+        norm_notes = []  # normalization annotations
+        has_unrecognized = False
+        for j in range(len(tokens_i)):
+            num_i = _to_number(tokens_i[j])
+            num_l = _to_number(tokens_l[j])
+            if num_i is None or num_l is None:
+                has_unrecognized = True
+                continue
+
+            raw_i_int = int(round(num_i))
+            raw_l_int = int(round(num_l))
+            norm_i = _normalize_diam(num_i, unit)
+            norm_l = _normalize_diam(num_l, unit)
+
+            if raw_i_int != norm_i:
+                norm_notes.append(f"I[{j}]: {raw_i_int}→{norm_i}")
+            if raw_l_int != norm_l:
+                norm_notes.append(f"L[{j}]: {raw_l_int}→{norm_l}")
+
+            gi = _grade_index(num_i, unit)
+            gl = _grade_index(num_l, unit)
+
+            if gi is None or gl is None:
+                has_unrecognized = True
+                continue
+
+            delta = gl - gi
+            if delta > 1:
+                jumps.append((j, norm_i, norm_l, delta))
+
+        if has_unrecognized and not jumps:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="I/L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={str(raw_i).strip()}, L={str(raw_l).strip()}",
+                    expected_value=f"recognized {unit} values in grade table",
+                    message=f"נכשל: קוטר לא סטנדרטי בטבלת מדרגות ({unit}) | I_list={tokens_i} L_list={tokens_l}",
+                    excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                )
+            )
+            continue
+
+        # Build per-pair debug info (with normalization)
+        pair_details = []
+        for j in range(len(tokens_i)):
+            ni = _to_number(tokens_i[j])
+            nl = _to_number(tokens_l[j])
+            if ni is not None:
+                ni_norm = _normalize_diam(ni, unit)
+                ni_lbl = f"{int(round(ni))}({ni_norm})" if int(round(ni)) != ni_norm else str(ni_norm)
+            else:
+                ni_lbl = str(tokens_i[j])
+                ni_norm = None
+            if nl is not None:
+                nl_norm = _normalize_diam(nl, unit)
+                nl_lbl = f"{int(round(nl))}({nl_norm})" if int(round(nl)) != nl_norm else str(nl_norm)
+            else:
+                nl_lbl = str(tokens_l[j])
+                nl_norm = None
+            gi_dbg = _grade_index(ni, unit) if ni else None
+            gl_dbg = _grade_index(nl, unit) if nl else None
+            delta_dbg = (gl_dbg - gi_dbg) if (gi_dbg is not None and gl_dbg is not None) else "?"
+            pair_details.append(f"{ni_lbl}[{gi_dbg}]→{nl_lbl}[{gl_dbg}] Δ{delta_dbg}")
+        norm_str = f" | normalized: {', '.join(norm_notes)}" if norm_notes else ""
+        pairs_str = "; ".join(pair_details)
+
+        # No significant jumps → emit debug result
+        if not jumps:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="I/L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={str(raw_i).strip()}, L={str(raw_l).strip()} ({unit})",
+                    expected_value="jump > 1 grade step",
+                    message=f"דילוג: אין קפיצות בקוטר מעל מדרגה אחת | pairs: {pairs_str}{norm_str}",
+                    excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                )
+            )
+            continue
+
+        # ---- Step 1: Find matching row ----
+        # Normalize C, D, E of current row for comparison
+        c_val = _normalize_for_match(report_df.at[i, col_c])
+        d_val = _normalize_for_match(report_df.at[i, col_d])
+        e_val = _normalize_for_match(report_df.at[i, col_e])
+
+        match_found = False
+        match_row_excel = None
+
+        for r2 in range(len(report_df)):
+            if r2 == i:
+                continue
+            if not _is_real_row(r2):
+                continue
+
+            # F must be "פיתוח" or "שדרוג"
+            r2_f = normalize_text(str(report_df.at[r2, col_f] or "").strip())
+            if r2_f not in (normalize_text("פיתוח"), normalize_text("שדרוג")):
+                continue
+
+            # C, D, E must match
+            r2_c = _normalize_for_match(report_df.at[r2, col_c])
+            r2_d = _normalize_for_match(report_df.at[r2, col_d])
+            r2_e = _normalize_for_match(report_df.at[r2, col_e])
+
+            if r2_c == c_val and r2_d == d_val and r2_e == e_val:
+                match_found = True
+                match_row_excel = int(r2 + excel_row_offset)
+                break
+
+        jump_desc = ", ".join(f"{ji[1]}→{ji[2]} (Δ{ji[3]})" for ji in jumps)
+        sys_note = f"I_list={tokens_i} L_list={tokens_l} unit={unit} jumps=[{jump_desc}]{norm_str}"
+
+        # Also capture the matched row's F classification and df index
+        match_class = None
+        match_df_idx = None
+        if match_found:
+            match_df_idx = match_row_excel - excel_row_offset
+            r2_f_raw = str(report_df.at[match_df_idx, col_f] or "").strip()
+            match_class = r2_f_raw
+
+        if not match_found:
+            # Step 1 FAIL: no matching dev row found
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.CRITICAL,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="קוטר I→L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"I={str(raw_i).strip()}, L={str(raw_l).strip()} ({unit})",
+                    expected_value="שורת פיתוח/שדרוג תואמת",
+                    confidence=1.0,
+                    method="DiameterJumpMatch",
+                    excel_cells=[c for c in [_cell_ref(i, col_f), _cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
+                    message=(
+                        f"נכשל: קפיצת קוטר ({jump_desc}) – "
+                        f"נדרשת שורת פיתוח/שדרוג תואמת אך לא נמצאה "
+                        f"(C={c_val} D={d_val} E={e_val}) | {sys_note}"
+                    ),
+                )
+            )
+            continue
+
+        # ================================================================
+        # Step 2: Ratio check — compare expected vs actual AE split
+        # ================================================================
+
+        # --- Parse AE values ---
+        rehab_cost = _parse_money_ae(report_df.at[i, col_ae]) if col_ae else None
+        dev_cost = _parse_money_ae(report_df.at[match_df_idx, col_ae]) if col_ae else None
+
+        if rehab_cost is None or dev_cost is None:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="AE",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"rehab_AE={report_df.at[i, col_ae] if col_ae else '?'}, dev_AE={report_df.at[match_df_idx, col_ae] if col_ae else '?'}",
+                    expected_value="AE > 0 for both rows",
+                    confidence=1.0,
+                    method="DiameterJumpRatio",
+                    excel_cells=[c for c in [_cell_ref(i, col_ae), _cell_ref(match_df_idx, col_ae)] if c and col_ae],
+                    message=(
+                        f"נכשל: אין אומדן תקין (AE) לבדיקת יחס | "
+                        f"rehab_row={excel_row} dev_row={match_row_excel} | {sys_note}"
+                    ),
+                )
+            )
+            continue
+
+        total_cost = rehab_cost + dev_cost
+        if total_cost <= 0:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=int(i),
+                    column_name="AE",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"rehab_cost={rehab_cost}, dev_cost={dev_cost}, total=0",
+                    expected_value="total AE > 0",
+                    confidence=1.0,
+                    method="DiameterJumpRatio",
+                    message=f"נכשל: אומדן כולל = 0 | {sys_note}",
+                )
+            )
+            continue
+
+        rehab_share_actual = rehab_cost / total_cost
+
+        # --- Build segments for weighted average ---
+        # Try dev row diameters + lengths first
+        dev_diams = _parse_num_list(report_df.at[match_df_idx, col_l]) if col_l else []
+        dev_lens = _parse_num_list(report_df.at[match_df_idx, col_m]) if col_m else []
+
+        # Rehab row L_list as normalized values for lookup
+        rehab_l_nums = [_to_number(t) for t in tokens_l]
+        rehab_l_norms = [_normalize_diam(v, unit) if v is not None else None for v in rehab_l_nums]
+        rehab_i_nums = [_to_number(t) for t in tokens_i]
+
+        segments = []  # list of (norm_old, norm_new, weight, ratio)
+        segment_method = ""
+        segment_notes = []
+
+        # Normalize dev diameters too
+        dev_diams_norm = [_normalize_diam(d, unit) if d is not None else None for d in dev_diams] if dev_diams else []
+
+        if dev_diams_norm and all(d is not None for d in dev_diams_norm):
+            # Strategy A: use dev row's diameter list mapped into rehab L_list
+            segment_method = "dev_row"
+            dev_lens_valid = (
+                dev_lens
+                and len(dev_lens) == len(dev_diams_norm)
+                and all(ln is not None and ln > 0 for ln in dev_lens)
+            )
+            if not dev_lens_valid and dev_lens:
+                segment_notes.append(f"dev_lens count mismatch or invalid ({len(dev_lens)} vs {len(dev_diams_norm)}), using equal weights")
+
+            for k, norm_new_d in enumerate(dev_diams_norm):
+                if norm_new_d is None or norm_new_d <= 0:
+                    continue
+                # Find matching position in rehab L_list (normalized)
+                matched_idx = None
+                for ridx, rl_norm in enumerate(rehab_l_norms):
+                    if rl_norm is not None and rl_norm == norm_new_d:
+                        matched_idx = ridx
+                        break
+                if matched_idx is not None:
+                    old_raw = rehab_i_nums[matched_idx]
+                    if old_raw is not None and old_raw > 0:
+                        norm_old_d = _normalize_diam(old_raw, unit)
+                        ratio = _get_rehab_ratio(norm_old_d, norm_new_d)
+                        if ratio is not None:
+                            w = dev_lens[k] if dev_lens_valid else 1.0
+                            segments.append((norm_old_d, norm_new_d, w, ratio))
+                            segment_notes.append(f"dev[{k}]: {norm_old_d}→{norm_new_d} ratio={ratio} w={w}")
+                        else:
+                            segment_notes.append(f"dev[{k}]: {norm_old_d}→{norm_new_d} NOT IN RATIO TABLE")
+                    else:
+                        segment_notes.append(f"dev[{k}]: new_d={norm_new_d} matched rehab L[{matched_idx}] but old_d invalid")
+                else:
+                    raw_d = dev_diams[k] if dev_diams else '?'
+                    segment_notes.append(f"dev[{k}]: new_d={norm_new_d} (raw={raw_d}) not found in rehab L_list")
+
+        if not segments:
+            # Strategy B: fall back to rehab row's significant jumps from Step 1
+            segment_method = "rehab_jumps" if not segment_method else f"{segment_method}→rehab_jumps"
+            # Parse rehab lengths from J (for I diameters) or M (for L diameters)
+            rehab_lens_j = _parse_num_list(report_df.at[i, col_j]) if col_j else []
+            rehab_lens_m = _parse_num_list(report_df.at[i, col_m]) if col_m else []
+            # Prefer M lengths (aligned with L diameters)
+            rehab_lens = rehab_lens_m if rehab_lens_m else rehab_lens_j
+            lens_valid = (
+                rehab_lens
+                and len(rehab_lens) == len(tokens_l)
+                and all(ln is not None and ln > 0 for ln in rehab_lens)
+            )
+            if rehab_lens and not lens_valid:
+                segment_notes.append(f"rehab lens count mismatch ({len(rehab_lens)} vs {len(tokens_l)}), using equal weights")
+
+            for (j_idx, old_d_int, new_d_int, _delta) in jumps:
+                ratio = _get_rehab_ratio(float(old_d_int), float(new_d_int))
+                if ratio is not None:
+                    w = rehab_lens[j_idx] if lens_valid else 1.0
+                    segments.append((float(old_d_int), float(new_d_int), w, ratio))
+                    segment_notes.append(f"jump[{j_idx}]: {old_d_int}→{new_d_int} ratio={ratio} w={w}")
+                else:
+                    segment_notes.append(f"jump[{j_idx}]: {old_d_int}→{new_d_int} NOT IN RATIO TABLE")
+
+        # --- Compute weighted average rehab share ---
+        if not segments:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="קוטר I→L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=f"no valid segments for ratio calc",
+                    expected_value="at least one diameter segment",
+                    method="DiameterJumpRatio",
+                    message=(
+                        f"דילוג: לא נמצאו מקטעים בטבלת היחסים לחישוב | "
+                        f"segments_tried=[{'; '.join(segment_notes)}] | "
+                        f"dev_diams={dev_diams} dev_lens={dev_lens} | {sys_note}"
+                    ),
+                )
+            )
+            continue
+
+        total_weight = sum(s[2] for s in segments)
+        if total_weight <= 0:
+            total_weight = len(segments)
+            segments = [(s[0], s[1], 1.0, s[3]) for s in segments]
+
+        # Weighted average using predefined ratios from table
+        rehab_share_expected = sum(
+            w * ratio for _od, _nd, w, ratio in segments
+        ) / total_weight
+
+        # --- Compare ---
+        diff = abs(rehab_share_actual - rehab_share_expected)
+        ratio_ok = diff <= STEP2_TOLERANCE
+
+        # --- Build system note ---
+        step2_note = (
+            f"key=({c_val}|{d_val}|{e_val}) "
+            f"rehab_row={excel_row} dev_row={match_row_excel} dev_class={match_class} | "
+            f"rehab_I={tokens_i} rehab_L={tokens_l} "
+            f"dev_diams={[d for d in dev_diams]} dev_lens={[l for l in dev_lens]} | "
+            f"segments=[{'; '.join(segment_notes)}] method={segment_method} | "
+            f"rehab_share_expected={rehab_share_expected:.4f} "
+            f"rehab_share_actual={rehab_share_actual:.4f} diff={diff:.4f} "
+            f"tolerance={STEP2_TOLERANCE} | "
+            f"rehab_cost={rehab_cost} dev_cost={dev_cost} total={total_cost}"
+        )
+
+        if ratio_ok:
+            status = Status.PASS_
+            sev = Severity.INFO
+            msg = (
+                f"עבר: קפיצת קוטר ({jump_desc}) – "
+                f"שורת {match_class} תואמת בשורה {match_row_excel}, "
+                f"יחס שיקום בפועל {rehab_share_actual:.1%} "
+                f"קרוב לצפוי {rehab_share_expected:.1%} (Δ{diff:.1%}) | {step2_note}"
+            )
+            excel_cells = None
+        else:
+            status = Status.FAIL
+            sev = Severity.CRITICAL
+            msg = (
+                f"נכשל: יחס לא תקין – קפיצת קוטר ({jump_desc}) – "
+                f"שורת {match_class} בשורה {match_row_excel}: "
+                f"יחס שיקום בפועל {rehab_share_actual:.1%} "
+                f"שונה מהצפוי {rehab_share_expected:.1%} (Δ{diff:.1%}, "
+                f"סף={STEP2_TOLERANCE:.0%}) | {step2_note}"
+            )
+            excel_cells = [c for c in [
+                _cell_ref(i, col_ae), _cell_ref(match_df_idx, col_ae),
+                _cell_ref(i, col_i), _cell_ref(i, col_l),
+            ] if c]
+
+        results.append(
+            CheckResult(
+                rule_id=RULE_ID,
+                rule_name=RULE_NAME,
+                severity=sev,
+                sheet_name=SHEET,
+                status=status,
+                row_index=int(i),
+                column_name="קוטר I→L / AE",
+                key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                actual_value=f"rehab_share={rehab_share_actual:.1%} (rehab={rehab_cost}, dev={dev_cost})",
+                expected_value=f"rehab_share≈{rehab_share_expected:.1%} ±{STEP2_TOLERANCE:.0%}",
+                confidence=1.0,
+                method="DiameterJumpRatio",
                 excel_cells=excel_cells,
                 message=msg,
             )
@@ -2757,7 +3532,7 @@ def check_023_pipe_cost_rule_of_thumb(
     # ---- excel cell refs ----
     col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = header_row + 2
+    excel_row_offset = header_row + 3
 
     def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = col_to_excel_letter.get(col_name)

@@ -222,11 +222,11 @@ def _build_insights_by_row(all_checks_df: pd.DataFrame) -> List[Dict[str, Any]]:
 
     df["row_int"] = df["row_index"].apply(lambda x: int(float(x)))
 
-    # Compute excel row (report sheet offset +8)
+    # Compute excel row (report sheet offset +9)
     def _excel_row(row):
         sheet = str(row.get("sheet_name", "") or "")
         if "דיווח" in sheet:
-            return row["row_int"] + 8
+            return row["row_int"] + 9
         return row["row_int"]
 
     df["excel_row"] = df.apply(_excel_row, axis=1)
