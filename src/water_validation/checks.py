@@ -3585,11 +3585,43 @@ def check_023_pipe_cost_rule_of_thumb(
         raw_g = str(report_df.at[i, col_g] or "").strip()
         g_norm = normalize_text(raw_g)
         if "קווי מים" not in g_norm:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="G",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=raw_g or "(ריק)",
+                    expected_value="קווי מים",
+                    message=f"דילוג: קוד הנדסי אינו קווי מים (G={raw_g or '(ריק)'})",
+                    excel_cells=[_cell_ref(i, col_g)] if _cell_ref(i, col_g) else None,
+                )
+            )
             continue
 
         # 2. Column L empty → skip
         raw_l = report_df.at[i, col_l]
         if _is_empty(raw_l):
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="L",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value="(ריק)",
+                    expected_value="קוטר תקין",
+                    message="דילוג: עמודת קוטר (L) ריקה",
+                    excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
+                )
+            )
             continue
 
         raw_l_str = str(raw_l).strip()
