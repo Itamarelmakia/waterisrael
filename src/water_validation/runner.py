@@ -160,7 +160,7 @@ def run_summary_sheet_checks(
     _run_rule("R_20", lambda: check_020_project_status_planning_report(report_df, cfg))
     _run_rule("R_21", lambda: check_021_diameter_jump_matching_row(report_df, cfg))
 
-    _run_rule("R_14", lambda: check_014_llm_project_funding_classification(report_df, cfg))
+    _run_rule("R_14", lambda: check_014_llm_project_funding_classification(report_df, cfg, utility_name=utility))
     _run_rule("R_23", lambda: check_023_pipe_cost_rule_of_thumb(report_df, cfg))
     _run_rule("R_24", lambda: check_024_short_pipe_projects_ratio(report_df, cfg))
 

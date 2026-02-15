@@ -66,6 +66,10 @@ class PlanConfig:
     # Default is False (normal behavior: שיקום/שדרוג is a valid investment label)
     r14_shikum_not_investment: bool = False
 
+    # --- Street lookup (Rule 14) ---
+    street_lookup_enabled: bool = True
+    street_lookup_timeout_sec: float = 15.0
+
 
 
 @dataclass(frozen=True)

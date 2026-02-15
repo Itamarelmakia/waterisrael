@@ -68,6 +68,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=f"Path to kinun JSON baseline (default: {default_kinun_json})",
     )
 
+    parser.add_argument(
+        "--disable-street-lookup",
+        action="store_true",
+        help="Disable street-name lookup via data.gov.il (enabled by default)",
+    )
+
     parser.add_argument("--verbose", action="store_true", help="Enable INFO logs")
 
     args = parser.parse_args(argv)
@@ -117,6 +123,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # LLM is enabled by default (from config.py), disable only if flag is passed
     if args.disable_llm:
         cfg.llm_enabled = False
+
+    if args.disable_street_lookup:
+        cfg.street_lookup_enabled = False
 
     all_dfs = []
     for plan_path in plan_files:

@@ -15,6 +15,8 @@ class Status(str, Enum):
     FAIL = "נכשל"
     INFO = "לא ידוע"  # For no prediction available
     NOT_APPLICABLE = "לא רלוונטי"
+    CLEAN = "לא חשוד"
+    FORBIDDEN_PROJECT_NAME = "שם פרויקט אסור"
 
 
 @dataclass

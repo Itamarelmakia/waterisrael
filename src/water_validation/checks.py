@@ -735,6 +735,7 @@ def _best_subject_match(project_name: str) -> tuple[str, float]:
 def check_014_llm_project_funding_classification(
     report_df: pd.DataFrame,
     cfg: PlanConfig,
+    utility_name: Optional[str] = None,
 ) -> List[CheckResult]:
     """
     R14 - Funding Classification Validation (LLM/NLP)
@@ -1329,6 +1330,7 @@ def check_014_llm_project_funding_classification(
             continue
 
         pn = normalize_text(project_name)
+        word_count = len(pn.split())
 
         # --- Pipeline: Predict label ---
         predicted = None
@@ -1419,41 +1421,130 @@ def check_014_llm_project_funding_classification(
                         confidence = 0.40  # Very low confidence
 
         # --- No decision (keyword/fuzzy/LLM/prior all failed or unavailable) ---
-        # Show the row with INFO status instead of skipping
+        # Try street lookup fallback before giving up
         if predicted is None:
-            # Check if this is a location-only name (no infra/action tokens)
-            if not _has_infra_or_action_token(pn):
-                print(f"[R_14 DEBUG]   -> No prediction: location-only name")
-                msg = (
-                    "לא ניתן לסווג - שם פרויקט כללי/מיקום בלבד (חסר סוג תשתית/פעולה)\n"
-                    "סיווג סופי: לא זמין"
+            # --- Street lookup fallback ---
+            street_handled = False
+            if getattr(cfg, "street_lookup_enabled", True) and utility_name:
+                try:
+                    from .ckan_client import fetch_streets_for_city, is_street_in_city, utility_to_city_name
+                    city_name = utility_to_city_name(utility_name)
+                    city_streets = fetch_streets_for_city(
+                        city_name,
+                        timeout=getattr(cfg, "street_lookup_timeout_sec", 5.0),
+                    )
+                    found, matched_street = is_street_in_city(pn, city_name, city_streets)
+                    if found:
+                        print(f"[R_14 DEBUG]   -> Street lookup: CLEAN (matched '{matched_street}' in {city_name})")
+                        results.append(
+                            CheckResult(
+                                rule_id=rule_id,
+                                rule_name=rule_name,
+                                severity=Severity.INFO,
+                                sheet_name=sheet,
+                                row_index=idx,
+                                column_name="סיווג פרויקט",
+                                status=Status.CLEAN,
+                                message=f"שם רחוב תקין - נמצא '{matched_street}' ברשימת הרחובות של {city_name}",
+                                actual_value=reported_raw,
+                                expected_value=f"רחוב מאומת: {matched_street}",
+                                key_context=f"project_name={project_name}",
+                                confidence=1.0,
+                                method="street_lookup",
+                            )
+                        )
+                        street_handled = True
+                    else:
+                        print(f"[R_14 DEBUG]   -> Street lookup: FORBIDDEN (no street match in {city_name})")
+                        results.append(
+                            CheckResult(
+                                rule_id=rule_id,
+                                rule_name=rule_name,
+                                severity=Severity.WARNING,
+                                sheet_name=sheet,
+                                row_index=idx,
+                                column_name="סיווג פרויקט",
+                                status=Status.FORBIDDEN_PROJECT_NAME,
+                                message=f"שם פרויקט אסור - לא נמצא רחוב תואם ברשימת הרחובות של {city_name}",
+                                actual_value=reported_raw,
+                                expected_value="(שם רחוב לא מזוהה)",
+                                key_context=f"project_name={project_name}",
+                                confidence=1.0,
+                                method="street_lookup",
+                            )
+                        )
+                        street_handled = True
+                except Exception as e:
+                    print(f"[R_14 DEBUG]   -> Street lookup error: {e!r}")
+
+            if not street_handled:
+                # Original no-decision logic
+                if not _has_infra_or_action_token(pn):
+                    print(f"[R_14 DEBUG]   -> No prediction: location-only name")
+                    msg = (
+                        "לא ניתן לסווג - שם פרויקט כללי/מיקום בלבד (חסר סוג תשתית/פעולה)\n"
+                        "סיווג סופי: לא זמין"
+                    )
+                else:
+                    print(f"[R_14 DEBUG]   -> No prediction available, showing as INFO")
+                    msg = (
+                        "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
+                        "סיווג סופי: לא זמין"
+                    )
+                no_decision_method = "fail_llm" if llm_was_attempted else "no_decision"
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.INFO,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.INFO,
+                        message=msg,
+                        actual_value=reported_raw,
+                        expected_value="(לא ניתן לחזות)",
+                        key_context=f"project_name={project_name}",
+                        confidence=0.0,
+                        method=no_decision_method,
+                    )
                 )
-            else:
-                print(f"[R_14 DEBUG]   -> No prediction available, showing as INFO")
-                msg = (
-                    "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
-                    "סיווג סופי: לא זמין"
-                )
-            # Determine method for "רמת בדיקה" column
-            no_decision_method = "fail_llm" if llm_was_attempted else "no_decision"
-            results.append(
-                CheckResult(
-                    rule_id=rule_id,
-                    rule_name=rule_name,
-                    severity=Severity.INFO,
-                    sheet_name=sheet,
-                    row_index=idx,
-                    column_name="סיווג פרויקט",
-                    status=Status.INFO,
-                    message=msg,
-                    actual_value=reported_raw,
-                    expected_value="(לא ניתן לחזות)",
-                    key_context=f"project_name={project_name}",
-                    confidence=0.0,
-                    method=no_decision_method,
-                )
-            )
             continue
+
+        # --- Short name street override (≤ 2 words) ---
+        # If pipeline produced a prediction but name is very short and matches a street,
+        # override with CLEAN (e.g. "משה דיין" classified as "פיתוח" but it's just a street)
+        if word_count <= 2 and getattr(cfg, "street_lookup_enabled", True) and utility_name:
+            try:
+                from .ckan_client import fetch_streets_for_city, is_street_in_city, utility_to_city_name
+                _city = utility_to_city_name(utility_name)
+                _city_streets = fetch_streets_for_city(
+                    _city,
+                    timeout=getattr(cfg, "street_lookup_timeout_sec", 15.0),
+                )
+                _found, _matched = is_street_in_city(pn, _city, _city_streets)
+                if _found:
+                    print(f"[R_14 DEBUG]   -> Short name street override: '{project_name}' matched '{_matched}' in {_city} (was {method}={predicted})")
+                    results.append(
+                        CheckResult(
+                            rule_id=rule_id,
+                            rule_name=rule_name,
+                            severity=Severity.INFO,
+                            sheet_name=sheet,
+                            row_index=idx,
+                            column_name="סיווג פרויקט",
+                            status=Status.CLEAN,
+                            message=f"שם רחוב תקין - נמצא '{_matched}' ברשימת הרחובות של {_city}",
+                            actual_value=reported_raw,
+                            expected_value=f"רחוב מאומת: {_matched}",
+                            key_context=f"project_name={project_name}",
+                            confidence=1.0,
+                            method="street_lookup",
+                        )
+                    )
+                    continue
+            except Exception as e:
+                print(f"[R_14 DEBUG]   -> Short name street lookup error: {e!r}")
 
         # Ensure canonical forms
         predicted = canonicalize_label(predicted)
@@ -1954,15 +2045,24 @@ def check_018_facility_rehab_upgrade(
     id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
     id_col = norm_to_orig.get(id_norm)
 
+    # Column F (index 5, 0-based) — סיווג פרויקט
+    col_f = cols[5] if len(cols) > 5 else None
+    # Column G (index 6, 0-based) — קוד הנדסי
+    col_g = cols[6] if len(cols) > 6 else None
+    # Column O (index 14, 0-based) — סוג מתקן
+    col_o = cols[14] if len(cols) > 14 else None
+    col_o_label = _norm_col(col_o) if col_o else "O"
 
     details_cols = [c for c in cols if _norm_col(c).startswith(details_prefix)]
-    print("R18 resolved:", {"id": id_col, "year": year_col, "flow": flow_col, "details": len(details_cols)})
+    print("R18 resolved:", {"id": id_col, "year": year_col, "flow": flow_col, "col_o": col_o, "details": len(details_cols)})
 
     missing = []
     if year_col is None:
         missing.append(year_key)
     if flow_col is None:
         missing.append(flow_key)
+    if col_o is None:
+        missing.append("O")
     if id_col is None:
         missing.append(id_norm)
     if not details_cols:
@@ -2038,6 +2138,61 @@ def check_018_facility_rehab_upgrade(
             continue
         seen_project_ids.add(pid)
         excel_row = int(i + excel_row_offset)
+
+        # =========================================================
+        # Gate: F must be "שיקום ושדרוג" / "שיקום/שדרוג"
+        # =========================================================
+        _raw_f = report_df.iloc[i, 5] if col_f else ""
+        if isinstance(_raw_f, pd.Series):
+            _raw_f = _raw_f.iloc[0]
+        raw_f = str(_raw_f or "").strip()
+        f_norm = normalize_text(raw_f)
+        f_ok = f_norm in (normalize_text("שיקום ושדרוג"), normalize_text("שיקום/שדרוג"))
+        if not f_ok:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_BASE,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="F",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=raw_f or "(ריק)",
+                    expected_value="שיקום ושדרוג",
+                    message=f"לא רלוונטי: סיווג פרויקט אינו שיקום ושדרוג (F={raw_f or '(ריק)'})",
+                )
+            )
+            continue
+
+        # =========================================================
+        # Gate: G must be "מתקני מים" or "מתקני ביוב"
+        # =========================================================
+        _raw_g = report_df.iloc[i, 6] if col_g else ""
+        if isinstance(_raw_g, pd.Series):
+            _raw_g = _raw_g.iloc[0]
+        raw_g = str(_raw_g or "").strip()
+        g_norm = normalize_text(raw_g)
+        g_ok = "מתקני מים" in g_norm or "מתקני ביוב" in g_norm
+        if not g_ok:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_BASE,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.NOT_APPLICABLE,
+                    row_index=int(i),
+                    column_name="G",
+                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    actual_value=raw_g or "(ריק)",
+                    expected_value="מתקני מים / מתקני ביוב",
+                    message=f"לא רלוונטי: קוד הנדסי אינו מתקני מים או מתקני ביוב (G={raw_g or '(ריק)'})",
+                )
+            )
+            continue
+
         # =========================================================
         # Level 1 — שנת הקמה
         # =========================================================
@@ -2081,6 +2236,44 @@ def check_018_facility_rehab_upgrade(
                     f"עבר: שנת הקמה={year_int}"
                     if year_ok
                     else f"נכשל: שנת הקמה חייב להיות מספר שלם בין {MIN_YEAR} ל-{CUR_YEAR}. ערך בפועל: {raw_year!r}"
+                ),
+            )
+        )
+
+        # =========================================================
+        # Level 1b — עמודה O (סוג מתקן): not empty
+        # =========================================================
+        raw_o = report_df.iloc[i, 14] if col_o else None
+        if isinstance(raw_o, pd.Series):
+            raw_o = raw_o.iloc[0]
+        o_ok = not _is_empty(raw_o)
+
+        o_status = Status.PASS_ if o_ok else Status.FAIL
+        o_sev = Severity.INFO if o_ok else Severity.WARNING
+        o_cells = None
+        if not o_ok and col_o:
+            ref = _cell_ref(i, col_o)
+            o_cells = [ref] if ref else None
+
+        results.append(
+            CheckResult(
+                rule_id=f"{RULE_BASE}_{col_o_label}",
+                rule_name=RULE_NAME,
+                severity=o_sev,
+                sheet_name=SHEET,
+                status=o_status,
+                row_index=int(i),
+                column_name=col_o_label,
+                key_context=f"{id_norm}={pid} | excel_row={excel_row} | level={col_o_label}",
+                actual_value=raw_o,
+                expected_value="מכיל ערך",
+                confidence=1.0,
+                method="NotEmpty",
+                excel_cells=o_cells,
+                message=(
+                    f"עבר: {col_o_label}={raw_o!r}"
+                    if o_ok
+                    else f'נכשל: "{col_o_label}" לא יכול להיות ריק.'
                 ),
             )
         )
@@ -3399,16 +3592,11 @@ def check_021_diameter_jump_matching_row(
 # R_23 — בדיקת מחיר צנרת - לפי כלל אצבע
 # =============================================================================
 
-# mm → inch conversion table (known-good mappings only)
-_MM_TO_INCH: Dict[int, int] = {
-    100: 4, 160: 6, 200: 8, 250: 10, 315: 12,
-    355: 14, 400: 16, 450: 18, 500: 20, 630: 24,
-    710: 28, 800: 32, 1000: 40,
-    # 300→36 excluded: suspicious mapping (300mm ≈ 12" which already maps from 315mm)
-}
+# mm → inch conversion built from R_21 authoritative tables
+_MM_TO_INCH: Dict[int, int] = {mm: inch for mm, inch in zip(_GRADE_MM, _GRADE_INCH)}
 
 # Values at or below this threshold are treated as inches; above as mm
-_INCH_THRESHOLD = 50
+_INCH_THRESHOLD = 64
 
 
 def check_023_pipe_cost_rule_of_thumb(
@@ -3540,36 +3728,33 @@ def check_023_pipe_cost_rule_of_thumb(
             return None
         return f"{SHEET}!{letter}{int(df_i + excel_row_offset)}"
 
-    # ---- diameter conversion helper ----
-    def _diameter_to_inch(raw_val: str) -> Tuple[Optional[float], str]:
+    # ---- diameter conversion helper (uses R_21 normalize_to_nearest) ----
+    def _diameter_to_inch(raw_val) -> Tuple[Optional[float], str]:
         """
-        Convert raw diameter value to inches.
+        Convert raw diameter value to inches using authoritative table.
+        Normalizes to nearest standard value first.
         Returns (inch_value, note).
-        inch_value is None if conversion fails.
         """
         num = _to_number(raw_val)
         if num is None:
             return None, "ערך קוטר לא מספרי"
-
         if num <= 0:
             return None, "קוטר <= 0"
 
-        if num <= _INCH_THRESHOLD:
-            # Treat as inches directly
-            return num, ""
+        raw_int = int(round(num))
 
-        # Treat as mm — look up conversion
-        mm_int = int(round(num))
-        inch = _MM_TO_INCH.get(mm_int)
-        if inch is not None:
-            return float(inch), f"המרה: {mm_int}mm → {inch}\""
+        if raw_int <= _INCH_THRESHOLD:
+            # Treat as inches — normalize to nearest standard inch
+            norm = _normalize_to_nearest(raw_int, _GRADE_INCH)
+            note = f"{raw_int}→{norm}\"" if raw_int != norm else ""
+            return float(norm), note
 
-        # Try nearest mm key (tolerance ±5mm)
-        for mm_key, inch_val in _MM_TO_INCH.items():
-            if abs(mm_key - num) <= 5:
-                return float(inch_val), f"המרה (קירוב): {num}mm ≈ {mm_key}mm → {inch_val}\""
-
-        return None, f"ערך {mm_int}mm לא נמצא בטבלת ההמרה"
+        # Treat as mm — normalize then convert
+        norm_mm = _normalize_to_nearest(raw_int, _GRADE_MM)
+        inch = _MM_TO_INCH[norm_mm]
+        if raw_int != norm_mm:
+            return float(inch), f"המרה: {raw_int}mm→{norm_mm}mm→{inch}\""
+        return float(inch), f"המרה: {norm_mm}mm→{inch}\""
 
     # ---- main iteration ----
     results: List[CheckResult] = []
@@ -3581,10 +3766,10 @@ def check_023_pipe_cost_rule_of_thumb(
         excel_row = int(i + excel_row_offset)
         pid = str(report_df.at[i, id_col]).strip() if id_col else f"row_{i}"
 
-        # 1. Filter: only "קווי מים" in column G
+        # 1. Filter: only "קווי מים" or "קווי ביוב" in column G
         raw_g = str(report_df.at[i, col_g] or "").strip()
         g_norm = normalize_text(raw_g)
-        if "קווי מים" not in g_norm:
+        if "קווי מים" not in g_norm and "קווי ביוב" not in g_norm:
             results.append(
                 CheckResult(
                     rule_id=RULE_ID,
@@ -3596,8 +3781,8 @@ def check_023_pipe_cost_rule_of_thumb(
                     column_name="G",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
                     actual_value=raw_g or "(ריק)",
-                    expected_value="קווי מים",
-                    message=f"דילוג: קוד הנדסי אינו קווי מים (G={raw_g or '(ריק)'})",
+                    expected_value="קווי מים / קווי ביוב",
+                    message=f"דילוג: קוד הנדסי אינו קווי מים או קווי ביוב (G={raw_g or '(ריק)'})",
                     excel_cells=[_cell_ref(i, col_g)] if _cell_ref(i, col_g) else None,
                 )
             )
@@ -3610,15 +3795,15 @@ def check_023_pipe_cost_rule_of_thumb(
                 CheckResult(
                     rule_id=RULE_ID,
                     rule_name=RULE_NAME,
-                    severity=Severity.INFO,
+                    severity=Severity.WARNING,
                     sheet_name=SHEET,
-                    status=Status.NOT_APPLICABLE,
+                    status=Status.FAIL,
                     row_index=int(i),
                     column_name="L",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value="(ריק)",
-                    expected_value="קוטר תקין",
-                    message="דילוג: עמודת קוטר (L) ריקה",
+                    actual_value="אין ערך",
+                    expected_value="אין ערך",
+                    message="נכשל: אין ערך בעמודת קוטר (L)",
                     excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
                 )
             )
@@ -3626,29 +3811,52 @@ def check_023_pipe_cost_rule_of_thumb(
 
         raw_l_str = str(raw_l).strip()
 
-        # 3. Multi-value (contains ":") → skip
-        if ":" in raw_l_str:
+        # 3. Parse diameter(s) and length(s) — supports single and multi-value
+        l_tokens = [t.strip() for t in raw_l_str.split(":") if t.strip()]
+
+        raw_m = report_df.at[i, col_m]
+        raw_m_str = str(raw_m).strip() if not _is_empty(raw_m) else ""
+        m_tokens = [t.strip() for t in raw_m_str.split(":") if t.strip()] if raw_m_str else []
+
+        is_multi = len(l_tokens) > 1
+
+        # For multi-value: count must match between L and M
+        if is_multi and len(l_tokens) != len(m_tokens):
             results.append(
                 CheckResult(
                     rule_id=RULE_ID,
                     rule_name=RULE_NAME,
-                    severity=Severity.INFO,
+                    severity=Severity.WARNING,
                     sheet_name=SHEET,
-                    status=Status.NOT_APPLICABLE,
+                    status=Status.FAIL,
                     row_index=int(i),
-                    column_name="L",
+                    column_name="L/M",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value=raw_l_str,
-                    expected_value="ערך קוטר בודד",
-                    message=f"דילוג: קוטר מכיל מגוון ערכים ({raw_l_str})",
-                    excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
+                    actual_value="אי התאמה",
+                    expected_value="אי התאמה",
+                    confidence=1.0,
+                    method="RuleOfThumb",
+                    message=f"נכשל: אין התאמה בין אורכים לקטרים | L={raw_l_str} M={raw_m_str}",
+                    excel_cells=[c for c in [_cell_ref(i, col_l), _cell_ref(i, col_m)] if c],
                 )
             )
             continue
 
-        # 4. Convert diameter to inches
-        diameter_inch, conv_note = _diameter_to_inch(raw_l_str)
-        if diameter_inch is None:
+        # 4. Convert each diameter to inches
+        inch_vals = []
+        conv_notes = []
+        bad_diam = False
+        for t in l_tokens:
+            d_inch, note = _diameter_to_inch(t)
+            if d_inch is None:
+                bad_diam = True
+                conv_notes.append(f"{t}: {note}")
+                break
+            inch_vals.append(d_inch)
+            if note:
+                conv_notes.append(note)
+
+        if bad_diam:
             results.append(
                 CheckResult(
                     rule_id=RULE_ID,
@@ -3661,16 +3869,23 @@ def check_023_pipe_cost_rule_of_thumb(
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
                     actual_value=raw_l_str,
                     expected_value="קוטר תקין באינצ׳ או מ״מ",
-                    message=f"דילוג: {conv_note}",
+                    message=f"דילוג: {'; '.join(conv_notes)}",
                     excel_cells=[_cell_ref(i, col_l)] if _cell_ref(i, col_l) else None,
                 )
             )
             continue
 
-        # 5. Column M (pipe length) must be > 0
-        raw_m = report_df.at[i, col_m]
-        m_val = _to_number(raw_m)
-        if m_val is None or m_val <= 0:
+        # 5. Parse lengths
+        m_vals = []
+        for t in (m_tokens if m_tokens else [raw_m_str] if raw_m_str else []):
+            n = _to_number(t)
+            if n is not None and n > 0:
+                m_vals.append(n)
+            else:
+                m_vals.append(None)
+
+        total_length = sum(v for v in m_vals if v is not None)
+        if total_length <= 0:
             results.append(
                 CheckResult(
                     rule_id=RULE_ID,
@@ -3711,19 +3926,34 @@ def check_023_pipe_cost_rule_of_thumb(
             )
             continue
 
-        # 7. Calculate
-        estimated_calc = diameter_inch * 1.2 * 150
-        estimated_contractor = (ae_val * 1000) / m_val
+        # 7. Calculate — weighted average for multi-value, simple for single
+        if is_multi:
+            # Length-weighted estimated_calc
+            weighted_sum = 0.0
+            segment_details = []
+            for d_inch, m_v in zip(inch_vals, m_vals):
+                seg_len = m_v if m_v is not None else 0
+                seg_calc = d_inch * 1.2 * 150
+                weighted_sum += seg_calc * seg_len
+                segment_details.append(f"{d_inch}\"×{seg_len}m={round(seg_calc, 1)}")
+            estimated_calc = weighted_sum / total_length
+            conv_suffix = f" | segments: [{', '.join(segment_details)}] | {'; '.join(conv_notes)}" if conv_notes else f" | segments: [{', '.join(segment_details)}]"
+            diam_display = f"weighted({', '.join(str(d) for d in inch_vals)}\")"
+        else:
+            diameter_inch = inch_vals[0]
+            estimated_calc = diameter_inch * 1.2 * 150
+            conv_suffix = f" | {conv_notes[0]}" if conv_notes else ""
+            diam_display = f"{diameter_inch}\""
 
-        calc_round = round(estimated_calc, 1)
-        contr_round = round(estimated_contractor, 1)
+        # Contractor cost per meter = AE*1000 / total_length
+        estimated_contractor = (ae_val * 1000) / total_length
+
+        calc_round = int(round(estimated_calc))
+        contr_round = int(round(estimated_contractor))
 
         # 8. Deviation check — pass range: [calc, 1.5*calc]
-        #    fail if contractor < calc (too low) or contractor > 1.5*calc (too high)
         upper_bound = 1.5 * estimated_calc
         is_fail = (estimated_contractor < estimated_calc) or (estimated_contractor > upper_bound)
-
-        conv_suffix = f" | {conv_note}" if conv_note else ""
 
         refs = []
         for c in [col_l, col_m, col_ae]:
@@ -3731,13 +3961,13 @@ def check_023_pipe_cost_rule_of_thumb(
             if r:
                 refs.append(r)
 
-        expected_range = f"{calc_round}-{round(upper_bound, 1)} ₪ (כלל אצבע: {calc_round} ₪)"
+        expected_range = f"{calc_round}-{int(round(upper_bound))} ₪ (כלל אצבע: {calc_round} ₪)"
 
         if is_fail:
             if estimated_contractor < estimated_calc:
                 fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) נמוכה מכלל אצבע ({calc_round} ₪)"
             else:
-                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) חורגת מ-1.5× כלל אצבע ({round(upper_bound, 1)} ₪)"
+                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) חורגת מ-1.5× כלל אצבע ({int(round(upper_bound))} ₪)"
 
             results.append(
                 CheckResult(
@@ -3749,13 +3979,13 @@ def check_023_pipe_cost_rule_of_thumb(
                     row_index=int(i),
                     column_name="AE",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value=f"עלות קבלנית למטר: {contr_round} ₪",
+                    actual_value=contr_round,
                     expected_value=expected_range,
                     confidence=1.0,
                     method="RuleOfThumb",
                     message=(
                         f"חריגה: {fail_reason} | "
-                        f"קוטר={diameter_inch}\" | AE={ae_val} | M={m_val}{conv_suffix}"
+                        f"קוטר={diam_display} | AE={ae_val} | M={total_length}{conv_suffix}"
                     ),
                     excel_cells=refs or None,
                 )
@@ -3771,14 +4001,14 @@ def check_023_pipe_cost_rule_of_thumb(
                     row_index=int(i),
                     column_name="AE",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value=f"עלות קבלנית למטר: {contr_round} ₪",
+                    actual_value=contr_round,
                     expected_value=expected_range,
                     confidence=1.0,
                     method="RuleOfThumb",
                     message=(
                         f"תקין: עלות קבלנית למטר ({contr_round} ₪) "
-                        f"בטווח {calc_round}-{round(upper_bound, 1)} ₪ | "
-                        f"קוטר={diameter_inch}\"{conv_suffix}"
+                        f"בטווח {calc_round}-{int(round(upper_bound))} ₪ | "
+                        f"קוטר={diam_display}{conv_suffix}"
                     ),
                     excel_cells=refs or None,
                 )
