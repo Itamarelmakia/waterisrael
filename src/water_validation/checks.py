@@ -1064,6 +1064,15 @@ def check_014_llm_project_funding_classification(
     project_col = col_map.get("שם פרויקט")
     class_col = col_map.get("סיווג פרויקט")
 
+    # Column H: "חומר מבנה" (material) — for forbidden name check
+    _r14_material_col = col_map.get("חומר מבנה")
+    _r14_material_col_idx = None
+    if _r14_material_col is not None:
+        try:
+            _r14_material_col_idx = list(report_df.columns).index(_r14_material_col)
+        except ValueError:
+            _r14_material_col_idx = None
+
     missing = []
     if project_col is None:
         missing.append("שם פרויקט")
@@ -1421,41 +1430,113 @@ def check_014_llm_project_funding_classification(
                         confidence = 0.40  # Very low confidence
 
         # --- No decision (keyword/fuzzy/LLM/prior all failed or unavailable) ---
-        # Try street lookup fallback before giving up
+        # Try forbidden check, then street lookup fallback before giving up
         if predicted is None:
-            # --- Street lookup fallback ---
             street_handled = False
+
+            # --- Forbidden project name check (before street lookup) ---
             if getattr(cfg, "street_lookup_enabled", True) and utility_name:
+                forbidden_reason = None
+                # Check forbidden keywords
+                if "אחזקה" in pn:
+                    forbidden_reason = "שם מכיל 'אחזקה'"
+                elif "שותף" in pn:
+                    forbidden_reason = "שם מכיל 'שותף'"
+                # Check column H material in project name
+                if forbidden_reason is None and _r14_material_col is not None:
+                    try:
+                        mat_raw = report_df.iloc[idx, _r14_material_col_idx] if _r14_material_col_idx is not None else None
+                        if mat_raw is not None and not _is_empty(mat_raw):
+                            mat_norm = normalize_text(str(mat_raw).strip())
+                            if len(mat_norm) >= 2 and mat_norm in pn:
+                                forbidden_reason = f"שם מכיל חומר מבנה '{mat_raw}'"
+                    except Exception:
+                        pass
+
+                if forbidden_reason:
+                    trace = f"method=forbidden | reason={forbidden_reason} | decision=שם פרויקט אסור"
+                    print(f"[R_14 DEBUG]   -> Forbidden: {forbidden_reason}")
+                    results.append(
+                        CheckResult(
+                            rule_id=rule_id,
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            sheet_name=sheet,
+                            row_index=idx,
+                            column_name="סיווג פרויקט",
+                            status=Status.FORBIDDEN_PROJECT_NAME,
+                            message=f"שם פרויקט אסור: {forbidden_reason}\n{trace}",
+                            actual_value=reported_raw,
+                            expected_value="(שם פרויקט אסור)",
+                            key_context=f"project_name={project_name}",
+                            confidence=1.0,
+                            method="forbidden",
+                        )
+                    )
+                    street_handled = True
+
+            # --- Street lookup fallback (only if not forbidden) ---
+            if not street_handled and getattr(cfg, "street_lookup_enabled", True) and utility_name:
                 try:
-                    from .ckan_client import fetch_streets_for_city, is_street_in_city, utility_to_city_name
+                    from .ckan_client import (
+                        fetch_streets_for_city, find_best_street_match,
+                        utility_to_city_name, is_short_name,
+                        has_explicit_street_pattern, is_street_then_number,
+                    )
                     city_name = utility_to_city_name(utility_name)
                     city_streets = fetch_streets_for_city(
                         city_name,
-                        timeout=getattr(cfg, "street_lookup_timeout_sec", 5.0),
+                        timeout=getattr(cfg, "street_lookup_timeout_sec", 10.0),
                     )
-                    found, matched_street = is_street_in_city(pn, city_name, city_streets)
-                    if found:
-                        print(f"[R_14 DEBUG]   -> Street lookup: CLEAN (matched '{matched_street}' in {city_name})")
-                        results.append(
-                            CheckResult(
-                                rule_id=rule_id,
-                                rule_name=rule_name,
-                                severity=Severity.INFO,
-                                sheet_name=sheet,
-                                row_index=idx,
-                                column_name="סיווג פרויקט",
-                                status=Status.CLEAN,
-                                message=f"שם רחוב תקין - נמצא '{matched_street}' ברשימת הרחובות של {city_name}",
-                                actual_value=reported_raw,
-                                expected_value=f"רחוב מאומת: {matched_street}",
-                                key_context=f"project_name={project_name}",
-                                confidence=1.0,
-                                method="street_lookup",
-                            )
+                    match = find_best_street_match(pn, city_streets)
+                    trace_parts = [
+                        f"method=street_api",
+                        f"city_norm={city_name}",
+                        f"best_candidate={match.candidate or 'none'}",
+                        f"best_score={match.score}",
+                        f"match_type={match.match_type or 'none'}",
+                    ]
+
+                    if match.found:
+                        # Decision boundary: allow CLEAN only for short/simple names
+                        allow_clean = (
+                            is_short_name(project_name)
+                            or has_explicit_street_pattern(project_name)
+                            or is_street_then_number(project_name)
                         )
-                        street_handled = True
+                        if allow_clean:
+                            trace_parts.append("decision=לא חשוד")
+                            trace = " | ".join(trace_parts)
+                            print(f"[R_14 DEBUG]   -> Street lookup: CLEAN ('{match.street}' in {city_name}, score={match.score})")
+                            results.append(
+                                CheckResult(
+                                    rule_id=rule_id,
+                                    rule_name=rule_name,
+                                    severity=Severity.INFO,
+                                    sheet_name=sheet,
+                                    row_index=idx,
+                                    column_name="סיווג פרויקט",
+                                    status=Status.CLEAN,
+                                    message=f"שם רחוב תקין - נמצא '{match.street}' ברשימת הרחובות של {city_name}\n{trace}",
+                                    actual_value=reported_raw,
+                                    expected_value=f"רחוב מאומת: {match.street}",
+                                    key_context=f"project_name={project_name}",
+                                    confidence=1.0,
+                                    method="street_lookup",
+                                )
+                            )
+                            street_handled = True
+                        else:
+                            # Street found but name is long/complex — keep as INFO
+                            trace_parts.append("decision=skip_long_name")
+                            trace = " | ".join(trace_parts)
+                            print(f"[R_14 DEBUG]   -> Street found '{match.street}' but name too long, keeping INFO")
+                            # Fall through to original no-decision logic below
                     else:
-                        print(f"[R_14 DEBUG]   -> Street lookup: FORBIDDEN (no street match in {city_name})")
+                        # No street match — FORBIDDEN
+                        trace_parts.append("decision=שם פרויקט אסור")
+                        trace = " | ".join(trace_parts)
+                        print(f"[R_14 DEBUG]   -> Street lookup: FORBIDDEN (no match in {city_name}, score={match.score})")
                         results.append(
                             CheckResult(
                                 rule_id=rule_id,
@@ -1465,7 +1546,7 @@ def check_014_llm_project_funding_classification(
                                 row_index=idx,
                                 column_name="סיווג פרויקט",
                                 status=Status.FORBIDDEN_PROJECT_NAME,
-                                message=f"שם פרויקט אסור - לא נמצא רחוב תואם ברשימת הרחובות של {city_name}",
+                                message=f"שם פרויקט אסור - לא נמצא רחוב תואם ברשימת הרחובות של {city_name}\n{trace}",
                                 actual_value=reported_raw,
                                 expected_value="(שם רחוב לא מזוהה)",
                                 key_context=f"project_name={project_name}",
@@ -1511,38 +1592,49 @@ def check_014_llm_project_funding_classification(
                 )
             continue
 
-        # --- Short name street override (≤ 2 words) ---
-        # If pipeline produced a prediction but name is very short and matches a street,
+        # --- Short name street override (≤ 3 meaningful tokens) ---
+        # If pipeline produced a prediction but name is short and matches a street,
         # override with CLEAN (e.g. "משה דיין" classified as "פיתוח" but it's just a street)
-        if word_count <= 2 and getattr(cfg, "street_lookup_enabled", True) and utility_name:
+        if getattr(cfg, "street_lookup_enabled", True) and utility_name:
             try:
-                from .ckan_client import fetch_streets_for_city, is_street_in_city, utility_to_city_name
-                _city = utility_to_city_name(utility_name)
-                _city_streets = fetch_streets_for_city(
-                    _city,
-                    timeout=getattr(cfg, "street_lookup_timeout_sec", 15.0),
+                from .ckan_client import (
+                    fetch_streets_for_city, find_best_street_match,
+                    utility_to_city_name, is_short_name,
+                    has_explicit_street_pattern, is_street_then_number,
                 )
-                _found, _matched = is_street_in_city(pn, _city, _city_streets)
-                if _found:
-                    print(f"[R_14 DEBUG]   -> Short name street override: '{project_name}' matched '{_matched}' in {_city} (was {method}={predicted})")
-                    results.append(
-                        CheckResult(
-                            rule_id=rule_id,
-                            rule_name=rule_name,
-                            severity=Severity.INFO,
-                            sheet_name=sheet,
-                            row_index=idx,
-                            column_name="סיווג פרויקט",
-                            status=Status.CLEAN,
-                            message=f"שם רחוב תקין - נמצא '{_matched}' ברשימת הרחובות של {_city}",
-                            actual_value=reported_raw,
-                            expected_value=f"רחוב מאומת: {_matched}",
-                            key_context=f"project_name={project_name}",
-                            confidence=1.0,
-                            method="street_lookup",
-                        )
+                _allow_override = (
+                    is_short_name(project_name)
+                    or has_explicit_street_pattern(project_name)
+                    or is_street_then_number(project_name)
+                )
+                if _allow_override:
+                    _city = utility_to_city_name(utility_name)
+                    _city_streets = fetch_streets_for_city(
+                        _city,
+                        timeout=getattr(cfg, "street_lookup_timeout_sec", 10.0),
                     )
-                    continue
+                    _match = find_best_street_match(pn, _city_streets)
+                    if _match.found:
+                        _trace = f"method=street_api | city_norm={_city} | best_candidate={_match.candidate} | best_score={_match.score} | match_type={_match.match_type} | decision=לא חשוד (override {method})"
+                        print(f"[R_14 DEBUG]   -> Short name street override: '{project_name}' matched '{_match.street}' in {_city} (was {method}={predicted}, score={_match.score})")
+                        results.append(
+                            CheckResult(
+                                rule_id=rule_id,
+                                rule_name=rule_name,
+                                severity=Severity.INFO,
+                                sheet_name=sheet,
+                                row_index=idx,
+                                column_name="סיווג פרויקט",
+                                status=Status.CLEAN,
+                                message=f"שם רחוב תקין - נמצא '{_match.street}' ברשימת הרחובות של {_city}\n{_trace}",
+                                actual_value=reported_raw,
+                                expected_value=f"רחוב מאומת: {_match.street}",
+                                key_context=f"project_name={project_name}",
+                                confidence=1.0,
+                                method="street_lookup",
+                            )
+                        )
+                        continue
             except Exception as e:
                 print(f"[R_14 DEBUG]   -> Short name street lookup error: {e!r}")
 
