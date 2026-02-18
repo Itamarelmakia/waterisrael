@@ -1,8 +1,15 @@
 # src/water_validation/config.py
 from __future__ import annotations
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Optional, Tuple
+
+KINUN_VALUES_PATH: Path = Path(__file__).resolve().parents[2] / "baseline" / "kinun_values_2026.json"
 
 
 @dataclass
@@ -33,7 +40,8 @@ class PlanConfig:
     kinun_full_sewer_col: str = "תשתיות ביוב מלא"
     kinun_reduced_sewer_col: str = "תשתיות ביוב מופחת"
 
-    # Fixed Excel row mapping (1-based Excel rows)
+    # Fixed Excel row mapping (1-based Excel rows in the Summary sheet).
+    # Convert to DataFrame index via excel_row_to_df_index (uses data_start_excel_row set by loader).
     total_program_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 8, "ביוב": 9, "סה\"כ": 10})
     min_required_program_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 25, "ביוב": 26, "סה\"כ": 27})
     rehab_upgrade_min_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 28, "ביוב": 29, "סה\"כ": 30})

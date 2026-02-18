@@ -41,11 +41,12 @@ _streets_cache: dict[str, Set[str]] = {}
 
 
 def _normalize_street(name: str) -> str:
-    """Normalize a street name for comparison: strip, collapse whitespace, remove niqqud-like yod variants."""
+    """Normalize a street name for comparison: strip, collapse whitespace, Hebrew spelling variants."""
     s = re.sub(r"\s+", " ", str(name).strip())
-    # Normalize common Hebrew spelling variants (ktiv maleh -> ktiv haser)
-    # קריית -> קרית, שכוניית -> שכונית, etc.
+    # Normalize common Hebrew spelling variants (ktiv maleh / ktiv haser)
     s = re.sub(r"יי", "י", s)
+    # קריית <-> קרית (standardize to קרית for consistent matching)
+    s = re.sub(r"קריית", "קרית", s)
     return s
 
 
@@ -155,14 +156,28 @@ def _is_valid_unigram(token: str) -> bool:
     return True
 
 
+# Minimum score to accept a street match (passing score)
+PASSING_SCORE = 3
+
+
 @dataclass
 class StreetMatch:
     """Result of street matching with scoring."""
     found: bool
     street: Optional[str] = None
     score: int = 0
-    match_type: str = ""  # "bigram" | "unigram" | "pattern"
+    match_type: str = ""  # "exact" | "substring_exact" | "bigram" | "unigram" | "pattern"
     candidate: str = ""
+    exact_match: bool = False  # True when project name matches street 100% or contains exact street name
+
+
+def _street_appears_as_word(street: str, text: str) -> bool:
+    """True if street appears in text as a whole word (word boundaries)."""
+    if not street or len(street) < 2:
+        return False
+    # Word boundary: start/space/+ before, space/+/end after
+    pat = r"(^|[\s+])" + re.escape(street) + r"($|[\s+])"
+    return bool(re.search(pat, text))
 
 
 def find_best_street_match(
@@ -172,11 +187,12 @@ def find_best_street_match(
     """
     Score-based street matching. Returns the best match.
 
-    Scoring:
-      - bigram match: 3 points
-      - unigram match: 1 point
-      - "רחוב/רח'" pattern bonus: +2 points
-    Threshold: best_score >= 3 to accept.
+    - Exact full match (project name equals a street after normalization): score = PASSING_SCORE, exact_match=True.
+    - Substring exact match (project name contains a known street as whole word): score = PASSING_SCORE, exact_match=True.
+    - bigram match: 3 points
+    - unigram match: 1 point (alone does not pass; exact/unigram override fixes single-word streets)
+    - "רחוב/רח'" pattern bonus: +2 points
+    Threshold: best_score >= PASSING_SCORE to accept.
     """
     if not streets:
         return StreetMatch(found=False)
@@ -185,6 +201,33 @@ def find_best_street_match(
     tokens = norm.split()
 
     best = StreetMatch(found=False)
+
+    # --- Exact full match override: 100% match after cleaning → passing score (single-word streets) ---
+    if norm in streets:
+        return StreetMatch(
+            found=True,
+            street=norm,
+            score=PASSING_SCORE,
+            match_type="exact",
+            candidate=norm,
+            exact_match=True,
+        )
+
+    # --- Substring exact match: project name contains a known street (whole word) ---
+    substring_match: Optional[str] = None
+    for street in streets:
+        if _street_appears_as_word(street, norm):
+            if substring_match is None or len(street) > len(substring_match):
+                substring_match = street
+    if substring_match is not None:
+        return StreetMatch(
+            found=True,
+            street=substring_match,
+            score=PASSING_SCORE,
+            match_type="substring_exact",
+            candidate=substring_match,
+            exact_match=True,
+        )
 
     # Collect pattern-matched names (רחוב/רח') for bonus scoring
     pattern_names: set[str] = set()
@@ -195,7 +238,7 @@ def find_best_street_match(
     for i in range(len(tokens) - 1):
         bigram = _normalize_street(f"{tokens[i]} {tokens[i+1]}")
         if bigram in streets:
-            score = 3
+            score = PASSING_SCORE
             if bigram in pattern_names:
                 score += 2
             if score > best.score:
@@ -223,15 +266,15 @@ def find_best_street_match(
     # Phase 3: Pattern-only candidates not yet checked
     for pname in pattern_names:
         if pname in streets:
-            score = 3  # pattern match = 1 base + 2 bonus
+            score = PASSING_SCORE  # pattern match = 1 base + 2 bonus
             if score > best.score:
                 best = StreetMatch(
                     found=True, street=pname, score=score,
                     match_type="pattern", candidate=pname,
                 )
 
-    # Threshold: only accept if score >= 3
-    if best.score < 3:
+    # Threshold: only accept if score >= PASSING_SCORE
+    if best.score < PASSING_SCORE:
         return StreetMatch(found=False, street=best.street, score=best.score,
                            match_type=best.match_type, candidate=best.candidate)
 

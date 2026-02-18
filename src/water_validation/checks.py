@@ -78,6 +78,21 @@ def fmt_num(x, decimals=3):
 
 
 
+def _col_idx_to_letter(col_idx: int) -> str:
+    """Convert 0-based column index to Excel column letter(s). 0=A, 17=R, 26=AA."""
+    if col_idx < 0:
+        return ""
+    if col_idx < 26:
+        return chr(65 + col_idx)
+    q, r = divmod(col_idx, 26)
+    return chr(64 + q) + chr(65 + r)
+
+
+def _summary_sheet_cell(cfg: PlanConfig, excel_row_1based: int, col_letter: str) -> str:
+    """Exact Excel coordinate for the Summary sheet, e.g. 'סיכום תכנית השקעות!R15'."""
+    return f"{cfg.sheet_name}!{col_letter}{excel_row_1based}"
+
+
 def get_cell(plan_df: pd.DataFrame, df_row_idx: int, col_idx: int) -> Any:
     """
     Safe cell getter (by integer positions).
@@ -172,8 +187,21 @@ def check_001_kinun_values_rounded(
         kinun_round = round_half_up(kinun_raw, 0)
 
         ok = plan_round == kinun_round
+        cell_ref = f"R{excel_row}"
+        excel_cell = _summary_sheet_cell(cfg, excel_row, "R")
 
-        msg_prefix = "התאמה לאחר עיגול" if ok else "אי־התאמה לאחר עיגול"
+        if ok:
+            message = (
+                f"התאמה לאחר עיגול: תכנית {cell_ref} ‏{fmt_num(plan_round, 0)} "
+                f"(מקור: {fmt_num(plan_raw, 3)}), "
+                f"ערך כינון ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_raw, 3)})"
+            )
+        else:
+            message = (
+                f"Value in Excel [{cfg.sheet_name}!{cell_ref}] does not match Kinun 2026 value for [{utility}]. "
+                f"Excel: {fmt_num(plan_round, 0)} (raw {fmt_num(plan_raw, 3)}), "
+                f"Kinun 2026: {fmt_num(kinun_round, 0)} (raw {fmt_num(kinun_raw, 3)})"
+            )
 
         results.append(
             CheckResult(
@@ -187,12 +215,8 @@ def check_001_kinun_values_rounded(
                 actual_value=plan_round,
                 expected_value=kinun_round,
                 status=Status.PASS_ if ok else Status.FAIL,
-                message=(
-                    f"{msg_prefix}: תכנית R{excel_row} ‏{fmt_num(plan_round, 0)} "
-                    f"(מקור: {fmt_num(plan_raw, 3)}), "
-                    f"ערך כינון ‏{fmt_num(kinun_round, 0)} "
-                    f"(מקור: {fmt_num(kinun_raw, 3)})"
-                ),
+                message=message,
+                excel_cells=[excel_cell],
             )
         )
 
@@ -250,12 +274,11 @@ def check_rule02_03_asset_ratio(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[
                 expected_value=expected_value,
                 status=status,
                 message=message,
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
             )
         )
 
     return results
-
-
 
 
 def check_004_total_program_values(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
@@ -281,6 +304,7 @@ def check_004_total_program_values(plan_df: pd.DataFrame, cfg: PlanConfig) -> Li
                 expected_value="reported value",
                 status=Status.PASS_ if pd.notna(val) else Status.FAIL,
                 message=f"Value from R{excel_row} = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
             )
         )
     return results
@@ -311,10 +335,12 @@ def check_005_min_required_program(plan_df: pd.DataFrame, cfg: PlanConfig) -> Li
                 expected_value="reported value",
                 status=Status.PASS_ if pd.notna(val) else Status.FAIL,
                 message=f"Value from R{excel_row} = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
             )
         )
 
     return results
+
 
 def check_006_rehab_upgrade_min_required(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
     """
@@ -339,6 +365,7 @@ def check_006_rehab_upgrade_min_required(plan_df: pd.DataFrame, cfg: PlanConfig)
                 expected_value="reported value",
                 status=Status.PASS_ if pd.notna(val) else Status.FAIL,
                 message=f"Value from S{excel_row} = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "S")],
             )
         )
 
@@ -360,6 +387,8 @@ def check_007_total_planned_investments_by_city(plan_df: pd.DataFrame, cfg: Plan
     results: List[CheckResult] = []
     for city in city_cols:
         val = plan_df.at[df_idx, city] if df_idx in plan_df.index else None
+        col_idx = plan_df.columns.get_loc(city)
+        col_letter = _col_idx_to_letter(col_idx)
         results.append(
             CheckResult(
                 rule_id=f"R_007_{city}",
@@ -373,6 +402,7 @@ def check_007_total_planned_investments_by_city(plan_df: pd.DataFrame, cfg: Plan
                 expected_value="reported value",
                 status=Status.PASS_ if pd.notna(val) else Status.FAIL,
                 message=f"Value from row {excel_row} for '{city}' = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, col_letter)],
             )
         )
     return results
@@ -394,6 +424,8 @@ def check_008_funding_total_and_exists_by_city(plan_df: pd.DataFrame, cfg: PlanC
     for city in city_cols:
         val = plan_df.at[df_idx, city] if df_idx in plan_df.index else None
         exists = is_non_empty(val)
+        col_idx = plan_df.columns.get_loc(city)
+        col_letter = _col_idx_to_letter(col_idx)
         results.append(
             CheckResult(
                 rule_id=f"R_008_{city}",
@@ -407,6 +439,7 @@ def check_008_funding_total_and_exists_by_city(plan_df: pd.DataFrame, cfg: PlanC
                 expected_value="non-empty",
                 status=Status.PASS_ if exists else Status.FAIL,
                 message=f"Funding total for '{city}' from row {excel_row} = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, col_letter)],
             )
         )
     return results
@@ -439,6 +472,13 @@ def check_010_pipes_any_value(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[Ch
         v_sw = plan_df.at[idx_sw, city] if idx_sw in plan_df.index else None
 
         ok = is_non_empty(v_ws) or is_non_empty(v_wp) or is_non_empty(v_sw)
+        col_idx = plan_df.columns.get_loc(city)
+        col_letter = _col_idx_to_letter(col_idx)
+        excel_cells_list = [
+            _summary_sheet_cell(cfg, row_ws, col_letter),
+            _summary_sheet_cell(cfg, row_wp, col_letter),
+            _summary_sheet_cell(cfg, row_sw, col_letter),
+        ]
 
         results.append(
             CheckResult(
@@ -446,13 +486,14 @@ def check_010_pipes_any_value(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[Ch
                 rule_name="דיווח אורכי צנרת (לפחות ערך אחד מתוך 3 שורות)",
                 severity=Severity.WARNING,
                 sheet_name=cfg.sheet_name,
-                row_index=None,
+                row_index=idx_ws,
                 column_name=str(city),
                 key_context=f"rows={row_ws},{row_wp},{row_sw}; city={city}",
                 actual_value={"water_row56": v_ws, "water_row57": v_wp, "sewer_row58": v_sw},
                 expected_value="at least one non-empty among rows 56/57/58",
                 status=Status.PASS_ if ok else Status.FAIL,
                 message=f"row56={v_ws}, row57={v_wp}, row58={v_sw}",
+                excel_cells=excel_cells_list,
             )
         )
 
@@ -480,6 +521,8 @@ def check_011_pipes_values_by_type(plan_df: pd.DataFrame, cfg: PlanConfig) -> Li
     results: List[CheckResult] = []
 
     def emit(city: str, pipe_type: str, excel_row: int, df_idx: int, val: Any, suffix: str) -> None:
+        col_idx = plan_df.columns.get_loc(city)
+        col_letter = _col_idx_to_letter(col_idx)
         results.append(
             CheckResult(
                 rule_id=f"R_011_{suffix}_{city}",
@@ -493,6 +536,7 @@ def check_011_pipes_values_by_type(plan_df: pd.DataFrame, cfg: PlanConfig) -> Li
                 expected_value="reported value",
                 status=Status.PASS_,  # reporting
                 message=f"Value from row {excel_row} for '{city}' ({pipe_type}) = {val}",
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, col_letter)],
             )
         )
 
@@ -776,6 +820,28 @@ def check_014_llm_project_funding_classification(
         s = str(v).strip()
         return s == "" or s.lower() in {"nan", "none"}
 
+    def _is_generic_project_name(name: str) -> bool:
+        """
+        Return True if the name is short (<= 2 words after cleaning) AND lacks
+        an explicit action verb. Used to block over-confident LLM classification
+        of generic names (structural guard).
+        """
+        if not name or not isinstance(name, str):
+            return False
+        cleaned = re.sub(r"\s+", " ", str(name).strip()).strip()
+        words = [w for w in cleaned.split() if w]
+        if len(words) > 2:
+            return False
+        # Action verbs (safe): presence of any → not generic
+        action_verbs = [
+            "החלפה", "החלפת", "שדרוג", "חיזוק", "שיקום", "הקמה", "ביצוע", "הנחה", "הנחת",
+        ]
+        name_norm = normalize_text(cleaned)
+        for verb in action_verbs:
+            if verb in name_norm:
+                return False
+        return True
+
     def _confidence_bucket(c: float) -> str:
         return "ביטחון גבוה" if c >= R14_FUZZY_THRESHOLD else "ביטחון נמוך"
 
@@ -789,6 +855,8 @@ def check_014_llm_project_funding_classification(
             return f"סיווג סופי על ידי LLM: {label} (conf={conf:.2f})"
         if method == "prior":
             return f"סיווג סופי על ידי prior (ביטחון נמוך): {label} (conf={conf:.2f})"
+        if method == "structural_guard":
+            return "סיווג סופי: חסום על ידי structural guard (שם כללי)"
         # no-decision case
         return f"סיווג סופי על ידי LLM: לא זמין (conf=0.0)"
 
@@ -1341,14 +1409,53 @@ def check_014_llm_project_funding_classification(
         pn = normalize_text(project_name)
         word_count = len(pn.split())
 
+        # --- Step 1: Forbidden Names ---
+        if getattr(cfg, "street_lookup_enabled", True) and utility_name:
+            forbidden_reason = None
+            if "אחזקה" in pn:
+                forbidden_reason = "שם מכיל 'אחזקה'"
+            elif "שותף" in pn:
+                forbidden_reason = "שם מכיל 'שותף'"
+            if forbidden_reason is None and _r14_material_col is not None:
+                try:
+                    mat_raw = report_df.iloc[idx, _r14_material_col_idx] if _r14_material_col_idx is not None else None
+                    if mat_raw is not None and not _is_empty(mat_raw):
+                        mat_norm = normalize_text(str(mat_raw).strip())
+                        if len(mat_norm) >= 2 and mat_norm in pn:
+                            forbidden_reason = f"שם מכיל חומר מבנה '{mat_raw}'"
+                except Exception:
+                    pass
+            if forbidden_reason:
+                trace = f"method=forbidden | reason={forbidden_reason} | decision=שם פרויקט אסור"
+                print(f"[R_14 DEBUG]   -> Forbidden: {forbidden_reason}")
+                results.append(
+                    CheckResult(
+                        rule_id=rule_id,
+                        rule_name=rule_name,
+                        severity=Severity.WARNING,
+                        sheet_name=sheet,
+                        row_index=idx,
+                        column_name="סיווג פרויקט",
+                        status=Status.FORBIDDEN_PROJECT_NAME,
+                        message=f"שם פרויקט אסור: {forbidden_reason}\n{trace}",
+                        actual_value=reported_raw,
+                        expected_value="(שם פרויקט אסור)",
+                        key_context=f"project_name={project_name}",
+                        confidence=1.0,
+                        method="forbidden",
+                    )
+                )
+                continue
+
         # --- Pipeline: Predict label ---
         predicted = None
         method = None
         confidence = 0.0
         candidate_allowed_set = None
         llm_was_attempted = False  # Track if LLM was actually called
+        street_found = False  # Set True when street validation finds a match (any allow_clean outcome)
 
-        # Stage A: Keyword
+        # Step 2: Keyword
         kw_label, kw_conf = _predict_by_keyword(pn)
         # TEMP DEBUG
         print(f"[R_14 DEBUG] Row {idx}: project={project_name[:40]!r}")
@@ -1358,7 +1465,7 @@ def check_014_llm_project_funding_classification(
             method = "keyword"
             confidence = kw_conf
 
-        # Stage B: Fuzzy (only if keyword didn't decide)
+        # Step 3: Fuzzy (only if keyword didn't decide)
         if predicted is None:
             fuzzy_label, fuzzy_conf, fuzzy_allowed = _predict_by_fuzzy(pn, project_name)
             # TEMP DEBUG
@@ -1370,10 +1477,117 @@ def check_014_llm_project_funding_classification(
             else:
                 candidate_allowed_set = fuzzy_allowed
 
-        # Stage C: LLM (only if keyword + fuzzy failed)
+        # Step 4: Street Validation (moved up). If street found with high confidence -> CLEAN/PASS.
+        if predicted is None and getattr(cfg, "street_lookup_enabled", True) and utility_name:
+            try:
+                from .ckan_client import (
+                    fetch_streets_for_city, find_best_street_match,
+                    utility_to_city_name, is_short_name,
+                    has_explicit_street_pattern, is_street_then_number,
+                    PASSING_SCORE,
+                )
+                city_name = utility_to_city_name(utility_name)
+                city_streets = fetch_streets_for_city(
+                    city_name,
+                    timeout=getattr(cfg, "street_lookup_timeout_sec", 10.0),
+                )
+                match = find_best_street_match(pn, city_streets)
+                trace_parts = [
+                    f"method=street_api",
+                    f"city_norm={city_name}",
+                    f"best_candidate={match.candidate or 'none'}",
+                    f"best_score={match.score}",
+                    f"match_type={match.match_type or 'none'}",
+                ]
+                if match.found:
+                    street_found = True
+                    # Exact match or high-confidence score → CLEAN (skip LLM); else require short/explicit pattern
+                    allow_clean = (
+                        is_short_name(project_name)
+                        or has_explicit_street_pattern(project_name)
+                        or is_street_then_number(project_name)
+                        or getattr(match, "exact_match", False)
+                        or (match.score >= PASSING_SCORE)
+                    )
+                    if allow_clean:
+                        trace_parts.append("decision=לא חשוד")
+                        trace = " | ".join(trace_parts)
+                        print(f"[R_14 DEBUG]   -> Street lookup: CLEAN ('{match.street}' in {city_name}, score={match.score})")
+                        results.append(
+                            CheckResult(
+                                rule_id=rule_id,
+                                rule_name=rule_name,
+                                severity=Severity.INFO,
+                                sheet_name=sheet,
+                                row_index=idx,
+                                column_name="סיווג פרויקט",
+                                status=Status.CLEAN,
+                                message=f"שם רחוב תקין - נמצא '{match.street}' ברשימת הרחובות של {city_name}\n{trace}",
+                                actual_value=reported_raw,
+                                expected_value=f"רחוב מאומת: {match.street}",
+                                key_context=f"project_name={project_name}",
+                                confidence=1.0,
+                                method="street_lookup",
+                            )
+                        )
+                        continue
+                    else:
+                        trace_parts.append("decision=skip_long_name")
+                        print(f"[R_14 DEBUG]   -> Street found '{match.street}' but name too long, keeping INFO")
+                else:
+                    trace_parts.append("decision=שם פרויקט אסור")
+                    trace = " | ".join(trace_parts)
+                    print(f"[R_14 DEBUG]   -> Street lookup: FORBIDDEN (no match in {city_name}, score={match.score})")
+                    results.append(
+                        CheckResult(
+                            rule_id=rule_id,
+                            rule_name=rule_name,
+                            severity=Severity.WARNING,
+                            sheet_name=sheet,
+                            row_index=idx,
+                            column_name="סיווג פרויקט",
+                            status=Status.FORBIDDEN_PROJECT_NAME,
+                            message=f"שם פרויקט אסור - לא נמצא רחוב תואם ברשימת הרחובות של {city_name}\n{trace}",
+                            actual_value=reported_raw,
+                            expected_value="(שם רחוב לא מזוהה)",
+                            key_context=f"project_name={project_name}",
+                            confidence=1.0,
+                            method="street_lookup",
+                        )
+                    )
+                    continue
+            except Exception as e:
+                print(f"[R_14 DEBUG]   -> Street lookup error: {e!r}")
+
+        # Step 5: Structural Guard — do not call LLM for generic short names without street match.
+        if predicted is None and _is_generic_project_name(project_name) and not street_found:
+            print(f"[R_14 DEBUG]   -> Structural guard: generic name rejected (no street match), skipping LLM")
+            msg = (
+                "לא ניתן לסווג - שם כללי נחסם על ידי structural guard\n"
+                "Generic name rejected by structural guard"
+            )
+            results.append(
+                CheckResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    severity=Severity.INFO,
+                    sheet_name=sheet,
+                    row_index=idx,
+                    column_name="סיווג פרויקט",
+                    status=Status.INFO,
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value="(לא ניתן לחזות)",
+                    key_context=f"project_name={project_name}",
+                    confidence=0.0,
+                    method="structural_guard",
+                )
+            )
+            continue
+
+        # Step 6: LLM (only if keyword + fuzzy failed and not blocked by structural guard)
         if predicted is None:
             print(f"[R_14 DEBUG]   -> Entering LLM stage (keyword+fuzzy failed)")
-            # Check if LLM will actually be called (allowed_set matches and keys present)
             target_set = {"שיקום/שדרוג", "פיתוח"}
             if candidate_allowed_set == target_set:
                 llm_was_attempted = True
@@ -1429,167 +1643,39 @@ def check_014_llm_project_funding_classification(
                         method = "prior"
                         confidence = 0.40  # Very low confidence
 
-        # --- No decision (keyword/fuzzy/LLM/prior all failed or unavailable) ---
-        # Try forbidden check, then street lookup fallback before giving up
+        # --- No decision (keyword/fuzzy/street/structural guard/LLM/prior all failed or unavailable) ---
+        # Forbidden and street validation already run above; here we only emit no-decision.
         if predicted is None:
-            street_handled = False
-
-            # --- Forbidden project name check (before street lookup) ---
-            if getattr(cfg, "street_lookup_enabled", True) and utility_name:
-                forbidden_reason = None
-                # Check forbidden keywords
-                if "אחזקה" in pn:
-                    forbidden_reason = "שם מכיל 'אחזקה'"
-                elif "שותף" in pn:
-                    forbidden_reason = "שם מכיל 'שותף'"
-                # Check column H material in project name
-                if forbidden_reason is None and _r14_material_col is not None:
-                    try:
-                        mat_raw = report_df.iloc[idx, _r14_material_col_idx] if _r14_material_col_idx is not None else None
-                        if mat_raw is not None and not _is_empty(mat_raw):
-                            mat_norm = normalize_text(str(mat_raw).strip())
-                            if len(mat_norm) >= 2 and mat_norm in pn:
-                                forbidden_reason = f"שם מכיל חומר מבנה '{mat_raw}'"
-                    except Exception:
-                        pass
-
-                if forbidden_reason:
-                    trace = f"method=forbidden | reason={forbidden_reason} | decision=שם פרויקט אסור"
-                    print(f"[R_14 DEBUG]   -> Forbidden: {forbidden_reason}")
-                    results.append(
-                        CheckResult(
-                            rule_id=rule_id,
-                            rule_name=rule_name,
-                            severity=Severity.WARNING,
-                            sheet_name=sheet,
-                            row_index=idx,
-                            column_name="סיווג פרויקט",
-                            status=Status.FORBIDDEN_PROJECT_NAME,
-                            message=f"שם פרויקט אסור: {forbidden_reason}\n{trace}",
-                            actual_value=reported_raw,
-                            expected_value="(שם פרויקט אסור)",
-                            key_context=f"project_name={project_name}",
-                            confidence=1.0,
-                            method="forbidden",
-                        )
-                    )
-                    street_handled = True
-
-            # --- Street lookup fallback (only if not forbidden) ---
-            if not street_handled and getattr(cfg, "street_lookup_enabled", True) and utility_name:
-                try:
-                    from .ckan_client import (
-                        fetch_streets_for_city, find_best_street_match,
-                        utility_to_city_name, is_short_name,
-                        has_explicit_street_pattern, is_street_then_number,
-                    )
-                    city_name = utility_to_city_name(utility_name)
-                    city_streets = fetch_streets_for_city(
-                        city_name,
-                        timeout=getattr(cfg, "street_lookup_timeout_sec", 10.0),
-                    )
-                    match = find_best_street_match(pn, city_streets)
-                    trace_parts = [
-                        f"method=street_api",
-                        f"city_norm={city_name}",
-                        f"best_candidate={match.candidate or 'none'}",
-                        f"best_score={match.score}",
-                        f"match_type={match.match_type or 'none'}",
-                    ]
-
-                    if match.found:
-                        # Decision boundary: allow CLEAN only for short/simple names
-                        allow_clean = (
-                            is_short_name(project_name)
-                            or has_explicit_street_pattern(project_name)
-                            or is_street_then_number(project_name)
-                        )
-                        if allow_clean:
-                            trace_parts.append("decision=לא חשוד")
-                            trace = " | ".join(trace_parts)
-                            print(f"[R_14 DEBUG]   -> Street lookup: CLEAN ('{match.street}' in {city_name}, score={match.score})")
-                            results.append(
-                                CheckResult(
-                                    rule_id=rule_id,
-                                    rule_name=rule_name,
-                                    severity=Severity.INFO,
-                                    sheet_name=sheet,
-                                    row_index=idx,
-                                    column_name="סיווג פרויקט",
-                                    status=Status.CLEAN,
-                                    message=f"שם רחוב תקין - נמצא '{match.street}' ברשימת הרחובות של {city_name}\n{trace}",
-                                    actual_value=reported_raw,
-                                    expected_value=f"רחוב מאומת: {match.street}",
-                                    key_context=f"project_name={project_name}",
-                                    confidence=1.0,
-                                    method="street_lookup",
-                                )
-                            )
-                            street_handled = True
-                        else:
-                            # Street found but name is long/complex — keep as INFO
-                            trace_parts.append("decision=skip_long_name")
-                            trace = " | ".join(trace_parts)
-                            print(f"[R_14 DEBUG]   -> Street found '{match.street}' but name too long, keeping INFO")
-                            # Fall through to original no-decision logic below
-                    else:
-                        # No street match — FORBIDDEN
-                        trace_parts.append("decision=שם פרויקט אסור")
-                        trace = " | ".join(trace_parts)
-                        print(f"[R_14 DEBUG]   -> Street lookup: FORBIDDEN (no match in {city_name}, score={match.score})")
-                        results.append(
-                            CheckResult(
-                                rule_id=rule_id,
-                                rule_name=rule_name,
-                                severity=Severity.WARNING,
-                                sheet_name=sheet,
-                                row_index=idx,
-                                column_name="סיווג פרויקט",
-                                status=Status.FORBIDDEN_PROJECT_NAME,
-                                message=f"שם פרויקט אסור - לא נמצא רחוב תואם ברשימת הרחובות של {city_name}\n{trace}",
-                                actual_value=reported_raw,
-                                expected_value="(שם רחוב לא מזוהה)",
-                                key_context=f"project_name={project_name}",
-                                confidence=1.0,
-                                method="street_lookup",
-                            )
-                        )
-                        street_handled = True
-                except Exception as e:
-                    print(f"[R_14 DEBUG]   -> Street lookup error: {e!r}")
-
-            if not street_handled:
-                # Original no-decision logic
-                if not _has_infra_or_action_token(pn):
-                    print(f"[R_14 DEBUG]   -> No prediction: location-only name")
-                    msg = (
-                        "לא ניתן לסווג - שם פרויקט כללי/מיקום בלבד (חסר סוג תשתית/פעולה)\n"
-                        "סיווג סופי: לא זמין"
-                    )
-                else:
-                    print(f"[R_14 DEBUG]   -> No prediction available, showing as INFO")
-                    msg = (
-                        "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
-                        "סיווג סופי: לא זמין"
-                    )
-                no_decision_method = "fail_llm" if llm_was_attempted else "no_decision"
-                results.append(
-                    CheckResult(
-                        rule_id=rule_id,
-                        rule_name=rule_name,
-                        severity=Severity.INFO,
-                        sheet_name=sheet,
-                        row_index=idx,
-                        column_name="סיווג פרויקט",
-                        status=Status.INFO,
-                        message=msg,
-                        actual_value=reported_raw,
-                        expected_value="(לא ניתן לחזות)",
-                        key_context=f"project_name={project_name}",
-                        confidence=0.0,
-                        method=no_decision_method,
-                    )
+            if not _has_infra_or_action_token(pn):
+                print(f"[R_14 DEBUG]   -> No prediction: location-only name")
+                msg = (
+                    "לא ניתן לסווג - שם פרויקט כללי/מיקום בלבד (חסר סוג תשתית/פעולה)\n"
+                    "סיווג סופי: לא זמין"
                 )
+            else:
+                print(f"[R_14 DEBUG]   -> No prediction available, showing as INFO")
+                msg = (
+                    "לא ניתן לסווג - keyword/fuzzy/LLM לא החזירו תוצאה\n"
+                    "סיווג סופי: לא זמין"
+                )
+            no_decision_method = "fail_llm" if llm_was_attempted else "no_decision"
+            results.append(
+                CheckResult(
+                    rule_id=rule_id,
+                    rule_name=rule_name,
+                    severity=Severity.INFO,
+                    sheet_name=sheet,
+                    row_index=idx,
+                    column_name="סיווג פרויקט",
+                    status=Status.INFO,
+                    message=msg,
+                    actual_value=reported_raw,
+                    expected_value="(לא ניתן לחזות)",
+                    key_context=f"project_name={project_name}",
+                    confidence=0.0,
+                    method=no_decision_method,
+                )
+            )
             continue
 
         # --- Short name street override (≤ 3 meaningful tokens) ---
@@ -1601,6 +1687,7 @@ def check_014_llm_project_funding_classification(
                     fetch_streets_for_city, find_best_street_match,
                     utility_to_city_name, is_short_name,
                     has_explicit_street_pattern, is_street_then_number,
+                    PASSING_SCORE,
                 )
                 _allow_override = (
                     is_short_name(project_name)
@@ -1614,7 +1701,9 @@ def check_014_llm_project_funding_classification(
                         timeout=getattr(cfg, "street_lookup_timeout_sec", 10.0),
                     )
                     _match = find_best_street_match(pn, _city_streets)
-                    if _match.found:
+                    if _match.found and (
+                        getattr(_match, "exact_match", False) or _match.score >= PASSING_SCORE
+                    ):
                         _trace = f"method=street_api | city_norm={_city} | best_candidate={_match.candidate} | best_score={_match.score} | match_type={_match.match_type} | decision=לא חשוד (override {method})"
                         print(f"[R_14 DEBUG]   -> Short name street override: '{project_name}' matched '{_match.street}' in {_city} (was {method}={predicted}, score={_match.score})")
                         results.append(

@@ -107,51 +107,61 @@ RED_FILL = PatternFill(start_color="FFFF0000", end_color="FFFF0000", fill_type="
 
 def apply_red_highlights(output_xlsx_path: str, all_checks_df: pd.DataFrame) -> None:
     """
-    all_checks_df is the All_Checks dataframe (exported from CheckResult.to_record()).
-    It must include a column named 'excel_cells' which can be:
-      - None/NaN
-      - list[str]
-      - string representation of list[str] (depends how pandas wrote it)
+    Highlights failing checks in the output workbook.
+    - If excel_cells references a sheet that exists in the workbook, those cells are highlighted.
+    - For every row that has status Fail (or excel_cells pointing to input-only sheets like
+      'סיכום תכנית השקעות'), the corresponding row in the All_Checks sheet is highlighted
+      so the failing result is visible in the output file.
     """
     if all_checks_df is None or len(all_checks_df) == 0:
         return
-    if "excel_cells" not in all_checks_df.columns:
-        return
 
     wb = load_workbook(output_xlsx_path)
+    all_checks_sheet = "All_Checks"
+    has_excel_cells = "excel_cells" in all_checks_df.columns
+    has_status = "status" in all_checks_df.columns
 
-    for v in all_checks_df["excel_cells"].dropna():
-        cells = None
-        if isinstance(v, list):
-            cells = v
-        else:
-            s = str(v).strip()
-            if not s:
-                continue
-            # pandas often stores lists as string like "['Sheet!B12']"
-            try:
-                parsed = ast.literal_eval(s)
-                if isinstance(parsed, list):
-                    cells = parsed
-            except Exception:
-                # fallback: single "Sheet!B12"
-                cells = [s] if "!" in s else None
+    def _is_fail(s) -> bool:
+        if s is None or (hasattr(s, "__iter__") and not isinstance(s, str)):
+            return False
+        return str(s).strip() in ("Fail", "נכשל")
 
-        if not cells:
-            continue
+    for i in range(len(all_checks_df)):
+        row = all_checks_df.iloc[i]
+        excel_row_1based = i + 2  # data starts at row 2 (row 1 = header)
 
-        for ref in cells:
-            if not isinstance(ref, str) or "!" not in ref:
-                continue
-            sh, addr = ref.split("!", 1)
-            if sh not in wb.sheetnames:
-                continue
-            ws = wb[sh]
-            try:
-                ws[addr].fill = RED_FILL
-            except Exception:
-                # ignore invalid addresses
-                pass
+        # 1) Try to highlight cells from excel_cells if that sheet exists in output
+        if has_excel_cells:
+            v = row.get("excel_cells")
+            if v is not None and (isinstance(v, list) or str(v).strip()):
+                cells = v if isinstance(v, list) else None
+                if cells is None:
+                    s = str(v).strip()
+                    try:
+                        parsed = ast.literal_eval(s)
+                        cells = parsed if isinstance(parsed, list) else None
+                    except Exception:
+                        cells = [s] if "!" in s else None
+                if cells:
+                    for ref in cells:
+                        if not isinstance(ref, str) or "!" not in ref:
+                            continue
+                        sh, addr = ref.split("!", 1)
+                        if sh in wb.sheetnames:
+                            try:
+                                wb[sh][addr].fill = RED_FILL
+                            except Exception:
+                                pass
+
+        # 2) Highlight the corresponding row in All_Checks for every failure (so output file shows which rows failed)
+        if all_checks_sheet in wb.sheetnames and has_status and _is_fail(row.get("status")):
+            ws = wb[all_checks_sheet]
+            max_col = min(ws.max_column, 14)
+            for col in range(1, max_col + 1):
+                try:
+                    ws.cell(row=excel_row_1based, column=col).fill = RED_FILL
+                except Exception:
+                    pass
 
     wb.save(output_xlsx_path)
 

@@ -9,10 +9,8 @@ import pandas as pd
 from pathlib import Path
 import re
 
-DEFAULT_KINUN_JSON = Path(__file__).resolve().parents[2] / "baseline" / "kinun_values_2024.json"
-
 #from config import PlanConfig
-from .config import PlanConfig
+from .config import PlanConfig, KINUN_VALUES_PATH
 
 #from excel_io import load_kinun_reference, load_plan_sheet_with_header_fix
 from .excel_io import load_kinun_reference, load_plan_sheet_with_header_fix,load_report_sheet
@@ -87,7 +85,7 @@ def run_summary_sheet_checks(
     utility = extract_utility_from_plan_filename(plan_file)
     print(f"\n=== {Path(plan_file).name} ===")
 
-    kinun_json_path = Path(kinun_file) if kinun_file else DEFAULT_KINUN_JSON
+    kinun_json_path = Path(kinun_file) if kinun_file else KINUN_VALUES_PATH
     kinun_store = load_kinun_store(str(kinun_json_path))
     selected = _parse_rules_arg(rules)
     run_all = ("all" in selected)

@@ -8,7 +8,7 @@ import warnings
 import re
 
 #from config import InputDiscoveryConfig, PlanConfig
-from .config import InputDiscoveryConfig, PlanConfig
+from .config import InputDiscoveryConfig, PlanConfig, KINUN_VALUES_PATH
 
 #from excel_io import discover_inputs
 from .excel_io import discover_inputs
@@ -60,12 +60,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
     # NEW: allow overriding kinun JSON path (optional)
-    default_kinun_json = Path(__file__).resolve().parents[2] / "baseline" / "kinun_values_2024.json"
     parser.add_argument(
         "--kinun-json",
         type=str,
-        default=str(default_kinun_json),
-        help=f"Path to kinun JSON baseline (default: {default_kinun_json})",
+        default=str(KINUN_VALUES_PATH),
+        help=f"Path to kinun JSON baseline (default: {KINUN_VALUES_PATH})",
     )
 
     parser.add_argument(
@@ -147,6 +146,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Generate LLM executive summaries per file
     exec_summaries = generate_executive_summaries(all_checks, cfg)
 
+    # Write only to output file; original input Excel files are never modified.
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary_table.to_excel(writer, sheet_name="Summary_Table", index=False)
         headline.to_excel(writer, sheet_name="Executive_Summary", index=False)
