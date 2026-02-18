@@ -130,9 +130,17 @@ def fail_no_cities(rule_id: str, rule_name: str, cfg: PlanConfig) -> List[CheckR
 import json
 
 def load_kinun_store(json_path: str) -> dict:
+    """
+    Load kinun JSON. Returns dict with keys:
+      - "utilities": {utility_name: {water_full, water_reduced, sewer_full, sewer_reduced}, ...}
+      - "year": baseline year from JSON (e.g. 2026), for use in R_1 messages.
+    """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return data["utilities"]  # dict: {utility_name: {...}}
+    return {
+        "utilities": data["utilities"],
+        "year": data.get("year"),
+    }
 
 def lookup_kinun_value(kinun_store: dict, utility: str, col_name: str) -> float:
     """
@@ -165,12 +173,14 @@ def check_001_kinun_values_rounded(
     kinun_store,
     utility: str,
     cfg: PlanConfig,
+    kinun_year: Optional[int] = None,
 ) -> List[CheckResult]:
     """
-    Compare plan kinun values vs kinun reference (kinun_values_2026.json).
+    Compare plan kinun values vs kinun reference (e.g. kinun_values_2026.json).
     Plan values are read from column R at fixed Excel rows 8, 9, 11, 12.
     Mapping: R8=Total Plan (Col B), R9=Sewage (Col D), R11=Water (Col C), R12=Reclaimed/Other (Col E).
     Uses epsilon=1.0 for float tolerance.
+    If the plan was filled with a different year's kinun (e.g. 2024), use that year's JSON or update the plan.
     """
     # Explicit mapping: (Excel row, JSON key, report label for messages)
     # Column B (Total Approved) -> water_full, C (Water) -> water_reduced, D (Sewage) -> sewer_full, E (Other) -> sewer_reduced
@@ -198,15 +208,18 @@ def check_001_kinun_values_rounded(
         cell_ref = f"R{excel_row}"
         excel_cell = _summary_sheet_cell(cfg, excel_row, "R")
 
+        year_label = f"Kinun {kinun_year}" if kinun_year is not None else "Kinun"
         if ok:
             message = (
                 f"התאמה לאחר עיגול: תכנית {cell_ref} ({report_label}) ‏{fmt_num(plan_round, 0)} "
                 f"(מקור: {fmt_num(plan_val, 3)}), "
-                f"ערך כינון ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_val, 3)})"
+                f"{year_label} ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_val, 3)})"
             )
         else:
             message = (
-                f"Mismatch in {report_label} (R{excel_row}): Excel shows [{fmt_num(plan_round, 0)}], Kinun says [{fmt_num(kinun_round, 0)}]."
+                f"Mismatch in {report_label} (R{excel_row}): Excel shows [{fmt_num(plan_round, 0)}], "
+                f"{year_label} says [{fmt_num(kinun_round, 0)}]. "
+                f"(If the plan uses a different year's kinun, set KINUN_VALUES_PATH to that year's JSON.)"
             )
 
         # Rule id stable for reporting (e.g. R_1_Total_Plan, R_1_Sewage, ...)

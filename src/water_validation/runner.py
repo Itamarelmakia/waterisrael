@@ -86,7 +86,9 @@ def run_summary_sheet_checks(
     print(f"\n=== {Path(plan_file).name} ===")
 
     kinun_json_path = Path(kinun_file) if kinun_file else KINUN_VALUES_PATH
-    kinun_store = load_kinun_store(str(kinun_json_path))
+    kinun_data = load_kinun_store(str(kinun_json_path))
+    kinun_store = kinun_data["utilities"]
+    kinun_year = kinun_data.get("year")
     selected = _parse_rules_arg(rules)
     run_all = ("all" in selected)
 
@@ -134,7 +136,7 @@ def run_summary_sheet_checks(
     results = []
 
     # ---- Summary sheet rules ----
-    _run_rule("R_1",   lambda: check_001_kinun_values_rounded(plan_df, kinun_store, utility, cfg))
+    _run_rule("R_1",   lambda: check_001_kinun_values_rounded(plan_df, kinun_store, utility, cfg, kinun_year=kinun_year))
     _run_rule("R_2_3", lambda: check_rule02_03_asset_ratio(plan_df, cfg))
     _run_rule("R_4",   lambda: check_004_total_program_values(plan_df, cfg))
     _run_rule("R_5",   lambda: check_005_min_required_program(plan_df, cfg))
