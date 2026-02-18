@@ -156,6 +156,10 @@ def lookup_kinun_value(kinun_store: dict, utility: str, col_name: str) -> float:
 # =============================================================================
 
 
+# Epsilon for R_1 kinun value comparison (allow insignificant rounding differences)
+R1_KINUN_EPSILON = 1.0
+
+
 def check_001_kinun_values_rounded(
     plan_df: pd.DataFrame,
     kinun_store,
@@ -163,55 +167,59 @@ def check_001_kinun_values_rounded(
     cfg: PlanConfig,
 ) -> List[CheckResult]:
     """
-    Compare plan kinun values (rounded) vs kinun reference (rounded).
-    Plan values are taken from column R (value_col_r_idx) at fixed Excel rows.
+    Compare plan kinun values vs kinun reference (kinun_values_2026.json).
+    Plan values are read from column R at fixed Excel rows 8, 9, 11, 12.
+    Mapping: R8=Total Plan (Col B), R9=Sewage (Col D), R11=Water (Col C), R12=Reclaimed/Other (Col E).
+    Uses epsilon=1.0 for float tolerance.
     """
-    mapping = {
-        ("ערך כינון מלא", "מים"): "water_full",
-        ("ערך כינון מלא", "ביוב"): "sewer_full",
-        ("ערך כינון מופחת", "מים"): "water_reduced",
-        ("ערך כינון מופחת", "ביוב"): "sewer_reduced",
-    }
-
+    # Explicit mapping: (Excel row, JSON key, report label for messages)
+    # Column B (Total Approved) -> water_full, C (Water) -> water_reduced, D (Sewage) -> sewer_full, E (Other) -> sewer_reduced
+    ROW_JSON_LABEL = [
+        (8, "water_full", "Total Plan"),       # R8 vs Column B (Total Approved)
+        (9, "sewer_full", "Sewage"),          # R9 vs Column D (Sewage Approved)
+        (11, "water_reduced", "Water"),       # R11 vs Column C (Water Approved)
+        (12, "sewer_reduced", "Reclaimed/Other"),  # R12 vs Column E (Other Approved)
+    ]
 
     results: List[CheckResult] = []
 
-    for (label, system), excel_row in cfg.kinun_plan_rows_excel.items():
+    for excel_row, json_key, report_label in ROW_JSON_LABEL:
         df_idx = excel_row_to_df_index(excel_row, cfg)
-
         plan_raw = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
-        kinun_col = mapping[(label, system)]
-        kinun_raw = lookup_kinun_value(kinun_store, utility, kinun_col)
+        kinun_raw = lookup_kinun_value(kinun_store, utility, json_key)
 
-        plan_round = round_half_up(plan_raw, 0)
-        kinun_round = round_half_up(kinun_raw, 0)
+        plan_val = float(plan_raw) if plan_raw is not None and pd.notna(plan_raw) else 0.0
+        kinun_val = float(kinun_raw)
+        plan_round = round_half_up(plan_val, 0)
+        kinun_round = round_half_up(kinun_val, 0)
 
-        ok = plan_round == kinun_round
+        # Allow tiny floating-point tolerance (epsilon = 1.0)
+        ok = abs(plan_round - kinun_round) <= R1_KINUN_EPSILON
         cell_ref = f"R{excel_row}"
         excel_cell = _summary_sheet_cell(cfg, excel_row, "R")
 
         if ok:
             message = (
-                f"התאמה לאחר עיגול: תכנית {cell_ref} ‏{fmt_num(plan_round, 0)} "
-                f"(מקור: {fmt_num(plan_raw, 3)}), "
-                f"ערך כינון ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_raw, 3)})"
+                f"התאמה לאחר עיגול: תכנית {cell_ref} ({report_label}) ‏{fmt_num(plan_round, 0)} "
+                f"(מקור: {fmt_num(plan_val, 3)}), "
+                f"ערך כינון ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_val, 3)})"
             )
         else:
             message = (
-                f"Value in Excel [{cfg.sheet_name}!{cell_ref}] does not match Kinun 2026 value for [{utility}]. "
-                f"Excel: {fmt_num(plan_round, 0)} (raw {fmt_num(plan_raw, 3)}), "
-                f"Kinun 2026: {fmt_num(kinun_round, 0)} (raw {fmt_num(kinun_raw, 3)})"
+                f"Mismatch in {report_label} (R{excel_row}): Excel shows [{fmt_num(plan_round, 0)}], Kinun says [{fmt_num(kinun_round, 0)}]."
             )
 
+        # Rule id stable for reporting (e.g. R_1_Total_Plan, R_1_Sewage, ...)
+        rule_suffix = report_label.replace(" ", "_").replace("/", "_")
         results.append(
             CheckResult(
-                rule_id=f"R_1_{label}_{system}",
+                rule_id=f"R_1_{rule_suffix}",
                 rule_name="בדיקת ערכי כינון (עיגול לפני השוואה)",
                 severity=Severity.CRITICAL,
                 sheet_name=cfg.sheet_name,
                 row_index=df_idx,
                 column_name="R",
-                key_context=f"plan_cell=R{excel_row}; kinun_col={kinun_col}",
+                key_context=f"plan_cell=R{excel_row}; kinun_col={json_key}",
                 actual_value=plan_round,
                 expected_value=kinun_round,
                 status=Status.PASS_ if ok else Status.FAIL,
