@@ -117,7 +117,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     plan_files, _kinun_excel_file = discover_inputs(input_dir, disco)  # keep discovery, ignore XLSX
 
     cfg = PlanConfig(sheet_name="סיכום תכנית השקעות", header_lookback_rows=6)
-    cfg.asset_ratio_rows_excel = {"מים": 20, "ביוב": 21, "סה\"כ": 22}
+    # R_2 asset ratio rows: R17=Water, R18=Sewage, R19=Total (default from config)
 
     # LLM is enabled by default (from config.py), disable only if flag is passed
     if args.disable_llm:

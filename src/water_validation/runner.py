@@ -20,12 +20,18 @@ from .utils import extract_utility_from_plan_filename
 
 from .checks import (
     check_001_kinun_values_rounded,
-    check_rule02_03_asset_ratio,
+    check_002_asset_ratio,
+    check_003_defined_value_percent,
     check_004_total_program_values,
     check_005_min_required_program,
+    check_005_total_planned_investments_cross_row,
     check_006_rehab_upgrade_min_required,
+    check_006_sync_budget_sources_missing,
     check_007_total_planned_investments_by_city,
+    check_007_sync_budget_deficit,
     check_008_funding_total_and_exists_by_city,
+    check_008_pipe_lengths_water,
+    check_009_pipe_lengths_sewer,
     check_010_pipes_any_value,
     check_011_pipes_values_by_type,
     check_012_project_fields_not_empty,
@@ -137,12 +143,14 @@ def run_summary_sheet_checks(
 
     # ---- Summary sheet rules ----
     _run_rule("R_1",   lambda: check_001_kinun_values_rounded(plan_df, kinun_store, utility, cfg, kinun_year=kinun_year))
-    _run_rule("R_2_3", lambda: check_rule02_03_asset_ratio(plan_df, cfg))
+    _run_rule("R_2", lambda: check_002_asset_ratio(plan_df, cfg))
+    _run_rule("R_3", lambda: check_003_defined_value_percent(plan_df, cfg))
     _run_rule("R_4",   lambda: check_004_total_program_values(plan_df, cfg))
-    _run_rule("R_5",   lambda: check_005_min_required_program(plan_df, cfg))
-    _run_rule("R_6",   lambda: check_006_rehab_upgrade_min_required(plan_df, cfg))
-    _run_rule("R_7",   lambda: check_007_total_planned_investments_by_city(plan_df, cfg))
-    _run_rule("R_8",   lambda: check_008_funding_total_and_exists_by_city(plan_df, cfg))
+    _run_rule("R_5",   lambda: check_005_total_planned_investments_cross_row(plan_df, cfg))
+    _run_rule("R_6",   lambda: check_006_sync_budget_sources_missing(plan_df, cfg))
+    _run_rule("R_7",   lambda: check_007_sync_budget_deficit(plan_df, cfg))
+    _run_rule("R_8",   lambda: check_008_pipe_lengths_water(plan_df, cfg))
+    _run_rule("R_9",   lambda: check_009_pipe_lengths_sewer(plan_df, cfg))
     _run_rule("R_10",  lambda: check_010_pipes_any_value(plan_df, cfg))
     _run_rule("R_11",  lambda: check_011_pipes_values_by_type(plan_df, cfg))
 

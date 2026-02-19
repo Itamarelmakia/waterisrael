@@ -45,7 +45,8 @@ class PlanConfig:
     total_program_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 8, "ביוב": 9, "סה\"כ": 10})
     min_required_program_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 25, "ביוב": 26, "סה\"כ": 27})
     rehab_upgrade_min_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 28, "ביוב": 29, "סה\"כ": 30})
-    asset_ratio_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 20, "ביוב": 21, "סה\"כ": 22})
+    # R17=Water ratio, R18=Sewage ratio, R19=Total ratio (Summary sheet, column R)
+    asset_ratio_rows_excel: Dict[str, int] = field(default_factory=lambda: {"מים": 17, "ביוב": 18, "סה\"כ": 19})
 
     # (label, system) -> excel row
     kinun_plan_rows_excel: Dict[Tuple[str, str], int] = field(default_factory=lambda: {

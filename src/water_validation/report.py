@@ -9,14 +9,22 @@ from pathlib import Path
 # --- RULE DETAILS (פירוט הבדיקה) ---
 RULE_DETAILS = {
     "R_1": "השוואת ערכי כינון לפי קובץ השקעות וביצוע לבין ערכי הכינון",
+    "R_2": "יחס נכסים",
     "R_2_3": "ערך מצטבר - גריעת נכסים",
-    "R_3": "לציין את הערך שהוגדר",
+    "R_3": "לציין את הערך שהוגדר - ערך קיים ובטווח 0–100% (עמודה R שורות 20–22)",
+    # R_4 is split in the summary table into:
+    # - R_4_1 (4.1): מינימום נדרש + שיקום ושדרוג (עמודה R, שורות 25–30)
+    # - R_4_2 (4.2): יחס (עמודה S, שורות 28–30)
     "R_4": "שקיים ערך",
-    "R_5": "בדיקה שקיים ערך",
-    "R_6": "בדיקה שקיים ערך",
-    "R_7": "בדיקה שקיים ערך\nהערך צריך לצאת במינוס או 0",
-    "R_8": "בדיקה שקיים ערך",
-    "R_9": "בדיקה שקיים ערך",
+    "R_4_1": "שקיים ערך",
+    "R_4_2": "בדיקה שקיימים ערכים והיחס גדול מ 100%",
+    # Backwards compatibility (older exports)
+    "R_4_יחס": "בדיקה שקיימים ערכים והיחס גדול מ 100%",
+    "R_5": "דיווח סה\"כ השקעות מתוכננות לביצוע: לכל ישוב מדווח ברשות מקומית חייב להיות ערך לא ריק ולא 0 ב־סה\"כ השקעה מתוכננת (בטווח דוח סיכום תכנית השקעות)",
+    "R_6": "בדיקת סנכרון השקעות ומקורות מימון: לכל יישוב בשורה 4 חייב להיות ערך מקורות תקציב (שורה 50) לא ריק ולא 0",
+    "R_7": "בדיקת סנכרון השקעות ומקורות מימון: מקורות המימון (שורה 50) חייבים לכסות את ההשקעה המתוכננת (שורה 39) לכל יישוב",
+    "R_8": "דיווח אורכי צנרת מים: לכל יישוב (מלבד כפר סבא) חייב להיות ערך לא ריק ולא 0 בשורה 56 או 57",
+    "R_9": "דיווח אורכי צנרת ביוב: לכל יישוב (מלבד כפר סבא) חייב להיות ערך לא ריק ולא 0 בשורה 58",
     "R_10": "לכל ישוב - סה\"כ אורכי צנרת מים שדווחו לטיפול השנה מהווים ווה או יותר מ1/35 מסה\"כ צנרת בישוב שמדווחת בסכום תוכנית השקיעות למים (שורות 56 ו/או 57) להגדרת לוגיקת חישוב מדוייקת בהמשך",
     "R_11": "לשאול את איתי למה צריך את זה כי הרבה פעמים זה ריק",
     "R_12": "שדות חובה  שיהיה מלא",
@@ -198,6 +206,16 @@ def _extract_check_id(rule_id: str) -> str:
         second = int(parts[2])
         return f"R_{first}_{second}"
 
+    # Split R_4 into 4.1 and 4.2 in the summary:
+    # - R_4_מינימום_* / R_4_שיקום_* -> R_4_1
+    # - R_4_יחס_* -> R_4_2
+    if first == 4 and len(parts) >= 3:
+        token = parts[2]
+        if token in ("מינימום", "שיקום"):
+            return "R_4_1"
+        if token == "יחס":
+            return "R_4_2"
+
     return f"R_{first}"
 
 
@@ -269,7 +287,12 @@ def format_all_checks_for_export(all_checks: pd.DataFrame) -> pd.DataFrame:
         )
 
     df["פירוט הבדיקה"] = df["מזהה בדיקה"].map(RULE_DETAILS).fillna("")
-    
+
+    # R_1: מפתח בדיקה should show Hebrew name only (ערכי כינון מים מלא etc.)
+    r1_prefix = "R_1_"
+    mask_r1 = df["rule_id"].astype(str).str.startswith(r1_prefix, na=False)
+    df.loc[mask_r1, "rule_id"] = df.loc[mask_r1, "rule_id"].str[len(r1_prefix):]
+
     # rename to Hebrew
     df = df.rename(columns=RENAME_MAP)
 
@@ -519,16 +542,8 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
         return s in ("fail", "נכשל")
 
     # Same KPI logic as the CLI printing logic
+    # Total = number of sub-checks (rows in group). Fail = count of failed sub-checks.
     def _kpi_counts(gdf: pd.DataFrame) -> tuple[int, int]:
-        row_idxs = [int(x) for x in gdf["row_index"].dropna().tolist() if str(x).strip().lower() != "nan"]
-        if row_idxs:
-            total = len(set(row_idxs))
-            fail = len(set(
-                int(r) for r, s in zip(gdf["row_index"].tolist(), gdf["status"].tolist())
-                if r is not None and str(r).strip().lower() != "nan" and _status_is_fail(s)
-            ))
-            return fail, total
-
         total = len(gdf)
         fail = sum(1 for s in gdf["status"].tolist() if _status_is_fail(s))
         return fail, total
@@ -638,7 +653,7 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
             "שם הבדיקה": _pick_first_nonempty(gdf["rule_name"]),
             "פירוט הבדיקה": RULE_DETAILS.get(str(check_id), ""),
             "מיקום הבדיקה": _location_from_group(gdf),
-            "ממצאים": f"{check_id}: {fail}/{total} FAIL",
+            "ממצאים": f"{check_id}: {fail}/{total} {'FAIL' if fail > 0 else 'Pass'}",
             "סטטוס": _status_rollup(fail, total),
             "הערות": "",
             "הערת משתמש":  "",
@@ -734,6 +749,14 @@ def build_executive_summary_prompt(
             r24t = int(r24m.sum())
             r24 = f"R_24 פרויקטים קטנים: {r24f}/{r24t} כשלונות"
 
+    # R_3: emphasize in executive summary
+    r3_note = ""
+    if "rule_id" in df.columns and df["rule_id"].str.startswith("R_3").any():
+        r3_note = (
+            "חשוב – כלול והדגש בסיכום: \"לציין את הערך שהוגדר - צריך להכנס לסיכום מנהלים. "
+            "בהמשך יתבצעו בדיקות ביחס לערכים אלו.\"\n"
+        )
+
     prompt = (
         f"כתוב תקציר מנהלים קצר (עד 150 מילים) בעברית.\n"
         f"תאגיד: {utility_name}, שנים: {yr}\n"
@@ -743,6 +766,8 @@ def build_executive_summary_prompt(
         prompt += f"בדיקות עם הכי הרבה כשלונות: {top_fails}\n"
     if r24:
         prompt += f"{r24}\n"
+    if r3_note:
+        prompt += r3_note
     prompt += (
         "כלול: סיכום מצב, דפוסים חוזרים, המלצות מקצועיות.\n"
         "אל תמציא נתונים."
@@ -763,6 +788,12 @@ def generate_executive_summaries(
     if not cfg.llm_enabled:
         return {}
 
+    # Fixed R_3 emphasis to prepend to executive summary when R_3 was run
+    R_3_EMPHASIS = (
+        "【 הדגשה 】 לציין את הערך שהוגדר - צריך להכנס לסיכום מנהלים. "
+        "בהמשך יתבצעו בדיקות ביחס לערכים אלו.\n\n"
+    )
+
     summaries = {}
     for (utility, plan_file), gdf in all_checks_df.groupby(["utility_name", "plan_file"]):
         prompt = build_executive_summary_prompt(gdf, str(utility), str(plan_file))
@@ -772,6 +803,8 @@ def generate_executive_summaries(
                 provider=cfg.llm_provider,
                 model=cfg.llm_model,
             )
+            if "rule_id" in gdf.columns and gdf["rule_id"].str.startswith("R_3").any():
+                text = R_3_EMPHASIS + text
             summaries[str(utility)] = text
         except LLMQuotaError:
             summaries[str(utility)] = "שגיאה: חריגת מכסת LLM. לא ניתן ליצור תקציר."

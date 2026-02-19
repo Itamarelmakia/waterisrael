@@ -182,18 +182,21 @@ def check_001_kinun_values_rounded(
     Uses epsilon=1.0 for float tolerance.
     If the plan was filled with a different year's kinun (e.g. 2024), use that year's JSON or update the plan.
     """
-    # Explicit mapping: (Excel row, JSON key, report label for messages)
-    # Column B (Total Approved) -> water_full, C (Water) -> water_reduced, D (Sewage) -> sewer_full, E (Other) -> sewer_reduced
+    # Explicit mapping: (Excel row, JSON key, report label for messages, מפתח בדיקה display)
+    # Excel Row 8 (Water Full) -> water_full | ערכי כינון מים מלא
+    # Excel Row 9 (Sewage Full) -> sewer_full | ערכי כינון ביוב מלא
+    # Excel Row 11 (Water Reduced) -> water_reduced | ערכי כינון מים מופחת
+    # Excel Row 12 (Sewage Reduced) -> sewer_reduced | ערך כינון ביוב מופחת
     ROW_JSON_LABEL = [
-        (8, "water_full", "Total Plan"),       # R8 vs Column B (Total Approved)
-        (9, "sewer_full", "Sewage"),          # R9 vs Column D (Sewage Approved)
-        (11, "water_reduced", "Water"),       # R11 vs Column C (Water Approved)
-        (12, "sewer_reduced", "Reclaimed/Other"),  # R12 vs Column E (Other Approved)
+        (8, "water_full", "Water Full Value", "ערכי כינון מים מלא"),
+        (9, "sewer_full", "Sewage Full Value", "ערכי כינון ביוב מלא"),
+        (11, "water_reduced", "Water Reduced Value", "ערכי כינון מים מופחת"),
+        (12, "sewer_reduced", "Sewage Reduced Value", "ערך כינון ביוב מופחת"),
     ]
 
     results: List[CheckResult] = []
 
-    for excel_row, json_key, report_label in ROW_JSON_LABEL:
+    for excel_row, json_key, report_label, rule_key_hebrew in ROW_JSON_LABEL:
         df_idx = excel_row_to_df_index(excel_row, cfg)
         plan_raw = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
         kinun_raw = lookup_kinun_value(kinun_store, utility, json_key)
@@ -208,25 +211,22 @@ def check_001_kinun_values_rounded(
         cell_ref = f"R{excel_row}"
         excel_cell = _summary_sheet_cell(cfg, excel_row, "R")
 
-        year_label = f"Kinun {kinun_year}" if kinun_year is not None else "Kinun"
+        year_label = f"ערכי כינון {kinun_year}" if kinun_year is not None else "ערכי כינון"
         if ok:
             message = (
-                f"התאמה לאחר עיגול: תכנית {cell_ref} ({report_label}) ‏{fmt_num(plan_round, 0)} "
-                f"(מקור: {fmt_num(plan_val, 3)}), "
-                f"{year_label} ‏{fmt_num(kinun_round, 0)} (מקור: {fmt_num(kinun_val, 3)})"
+                f"התאמה בין {rule_key_hebrew} בתכנית ({cell_ref}) לבין ערכי הכינון: "
+                f"בתכנית ‏{fmt_num(plan_round, 0)}, ב{year_label} ‏{fmt_num(kinun_round, 0)}"
             )
         else:
             message = (
-                f"Mismatch in {report_label} (R{excel_row}): Excel shows [{fmt_num(plan_round, 0)}], "
-                f"{year_label} says [{fmt_num(kinun_round, 0)}]. "
-                f"(If the plan uses a different year's kinun, set KINUN_VALUES_PATH to that year's JSON.)"
+                f"חוסר התאמה ב{rule_key_hebrew} ({cell_ref}): בתכנית ‏{fmt_num(plan_round, 0)}, "
+                f"ב{year_label} ‏{fmt_num(kinun_round, 0)}. יש לבדוק את הנתונים או לעדכן את קובץ ערכי הכינון לפי שנת התכנית."
             )
 
-        # Rule id stable for reporting (e.g. R_1_Total_Plan, R_1_Sewage, ...)
-        rule_suffix = report_label.replace(" ", "_").replace("/", "_")
+        # Rule id: R_1_<hebrew> so grouping stays R_1; מפתח בדיקה shows Hebrew name in export
         results.append(
             CheckResult(
-                rule_id=f"R_1_{rule_suffix}",
+                rule_id=f"R_1_{rule_key_hebrew}",
                 rule_name="בדיקת ערכי כינון (עיגול לפני השוואה)",
                 severity=Severity.CRITICAL,
                 sheet_name=cfg.sheet_name,
@@ -247,50 +247,121 @@ def check_001_kinun_values_rounded(
 # -----------------------------------------
 
 
-def check_rule02_03_asset_ratio(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+def _row_label_from_col_b(plan_df: pd.DataFrame, df_idx: int, cfg: PlanConfig) -> str:
+    """Component name from Column B (index 1); fallback to Column A (index 0)."""
+    for col_idx in (cfg.data_marker_col_idx, cfg.label_col_idx):
+        v = get_cell(plan_df, df_idx, col_idx)
+        if v is not None and not (isinstance(v, float) and pd.isna(v)):
+            s = str(v).strip()
+            if s and s.lower() != "nan":
+                return s
+    return "שורה " + str(df_idx)
+
+
+def check_002_asset_ratio(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
     """
-    Asset ratio in column R should parse to a ratio and satisfy 0 < ratio < 1.
-    Accepts '95%' or 0.95 or 95 (interpreted as 0.95).
-    Rule02–03: merged asset disposal validation.
+    Rule R_2: יחס נכסים (Asset Ratio).
+
+    Column R, rows 17–19 (מים, ביוב, סה"כ). Value must exist (not None, empty, or 0).
     """
+    ROW_LABELS = ("מים", "ביוב", 'סה"כ')
     results: List[CheckResult] = []
 
-    for system, excel_row in cfg.asset_ratio_rows_excel.items():
+    for i, excel_row in enumerate((17, 18, 19)):
+        label = ROW_LABELS[i]
         df_idx = excel_row_to_df_index(excel_row, cfg)
         raw = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
-        ratio = parse_ratio(raw)
+        has_value = raw is not None and not (isinstance(raw, float) and pd.isna(raw))
+        if has_value and isinstance(raw, (int, float)):
+            try:
+                has_value = float(raw) != 0
+            except (TypeError, ValueError):
+                pass
+        elif has_value:
+            has_value = str(raw).strip() not in ("", "0")
 
-        if ratio is None:
-            status = Status.FAIL
-            message = (
-                f"חריגה – לא ניתן לפענח יחס גריעת נכסים. "
-                f"ערך מקורי: {raw!r}"
-            )
-            actual_value = raw
-            expected_value = "0%–100%"
+        status = Status.PASS_ if has_value else Status.FAIL
+        if status == Status.FAIL:
+            message = f"חסר ערך או ערך 0 ({label}) R{excel_row}"
         else:
-            ok = 0 < ratio < 1
-            status = Status.PASS_ if ok else Status.FAIL
-            ratio_pct = ratio * 100
-
-            prefix = "תקין" if ok else "חריגה"
-            message = (
-                f"{prefix} – גריעת נכסים: {ratio_pct:.1f}% "
-                f"(יחס={ratio:.3f}). "
-                f"צפוי: בין 0% ל־100%."
-            )
-            actual_value = f"{ratio_pct:.1f}%"
-            expected_value = "0%–100%"
-
+            message = f"ערך קיים ({label}) R{excel_row}"
+        actual_val = raw
+        if has_value and raw is not None:
+            try:
+                actual_val = round(float(raw), 2)
+            except (TypeError, ValueError):
+                pass
         results.append(
             CheckResult(
-                rule_id=f"R_2_3_{system}",
+                rule_id=f"R_2_{label.replace(chr(34), '')}",
                 rule_name="גריעת נכסים + פרטים",
                 severity=Severity.CRITICAL,
                 sheet_name=cfg.sheet_name,
                 row_index=df_idx,
                 column_name="R",
-                key_context=f"plan_cell=R{excel_row}",
+                key_context=f"plan_cell=R{excel_row}; value must exist and not 0",
+                actual_value=actual_val,
+                expected_value="ערך קיים ולא 0",
+                status=status,
+                message=message,
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
+            )
+        )
+
+    return results
+
+
+def check_003_defined_value_percent(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    Rule R_3: לציין את הערך שהוגדר.
+
+    Column R, rows 20–22 (מים, ביוב, סה"כ). Value must exist and be between 0 and 100 (%).
+    """
+    ROW_LABELS = ("מים", "ביוב", 'סה"כ')
+    results: List[CheckResult] = []
+
+    for i, excel_row in enumerate((20, 21, 22)):
+        label = ROW_LABELS[i]
+        df_idx = excel_row_to_df_index(excel_row, cfg)
+        raw = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
+        try:
+            val = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            val = None
+
+        # Cell stores ratio (e.g. 0.49 = 49%); do not divide — use as percent: 0.49 → 49%
+        if val is not None and 0 < val <= 1:
+            pct = val * 100
+        elif val is not None:
+            pct = val
+        else:
+            pct = None
+
+        if pct is None or (isinstance(raw, float) and pd.isna(raw)):
+            status = Status.FAIL
+            message = f"חסר ערך ({label}) R{excel_row}"
+            actual_value = raw
+            expected_value = "ערך בין 0 ל-100%"
+        elif not (0 <= pct <= 100):
+            status = Status.FAIL
+            message = f"ערך מחוץ לטווח 0–100% ({label}) R{excel_row}: {round(pct, 2)}%"
+            actual_value = f"{round(pct, 2)}%"
+            expected_value = "ערך בין 0 ל-100%"
+        else:
+            status = Status.PASS_
+            message = f"ערך בטווח ({label}) R{excel_row}: {round(pct, 2)}%"
+            actual_value = f"{round(pct, 2)}%"
+            expected_value = "ערך בין 0 ל-100%"
+
+        results.append(
+            CheckResult(
+                rule_id=f"R_3_{label.replace(chr(34), '')}",
+                rule_name="סה\"כ  נתוני תוכנית השקעה -יחס נכסים",
+                severity=Severity.CRITICAL,
+                sheet_name=cfg.sheet_name,
+                row_index=df_idx,
+                column_name="R",
+                key_context=f"plan_cell=R{excel_row}; value 0-100%",
                 actual_value=actual_value,
                 expected_value=expected_value,
                 status=status,
@@ -304,33 +375,206 @@ def check_rule02_03_asset_ratio(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[
 
 def check_004_total_program_values(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
     """
-    Reporting check: total program values in column R (rows 8/9/10 by system).
-    FAIL if missing.
+    Rule R_4: מינימום נדרש + שיקום ושדרוג (מימון עצמי) + ratio.
+
+    Sub-check 1: Column R rows 25,26,27 (מינימום נדרש) — must have values. Labels: מים, ביוב, סה"כ.
+    Sub-check 1b: Column R rows 28,29,30 (שיקום ושדרוג מימון עצמי) — must have values.
+    Sub-check 2: Column S rows 28,29,30 — value is ratio (e.g. 2.44 = 244.2%). Display 1 decimal, must be > 100%.
     """
+    ROW_LABELS = ("מים", "ביוב", 'סה"כ')
     results: List[CheckResult] = []
-    for system, excel_row in cfg.total_program_rows_excel.items():
+
+    # Sub-check 1: מינימום נדרש — Column R, rows 25, 26, 27
+    for i, excel_row in enumerate((25, 26, 27)):
+        label = ROW_LABELS[i]
         df_idx = excel_row_to_df_index(excel_row, cfg)
         val = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
+        has_value = val is not None and not (isinstance(val, float) and pd.isna(val))
+        if has_value and isinstance(val, (int, float)):
+            try:
+                has_value = float(val) != 0
+            except (TypeError, ValueError):
+                pass
+        elif has_value:
+            has_value = str(val).strip() not in ("", "0")
 
+        status = Status.PASS_ if has_value else Status.FAIL
+        message = f"מינימום נדרש ({label}) R{excel_row}: {'ערך קיים' if has_value else 'חסר ערך'}"
+        try:
+            actual_val = round(float(val), 2) if val is not None else None
+        except (TypeError, ValueError):
+            actual_val = val
         results.append(
             CheckResult(
-                rule_id=f"R_4_{system}",
-                rule_name='סה"כ נתוני תכנית השקעה',
-                severity=Severity.INFO,
+                rule_id=f"R_4_מינימום_{label.replace(chr(34), '')}",
+                rule_name='מינימום נדרש / שיקום ושדרוג',
+                severity=Severity.CRITICAL,
                 sheet_name=cfg.sheet_name,
                 row_index=df_idx,
                 column_name="R",
-                key_context=f"plan_cell=R{excel_row}",
-                actual_value=val,
-                expected_value="reported value",
-                status=Status.PASS_ if pd.notna(val) else Status.FAIL,
-                message=f"Value from R{excel_row} = {val}",
+                key_context=f"plan_cell=R{excel_row}; מינימום נדרש",
+                actual_value=actual_val,
+                expected_value="ערך קיים",
+                status=status,
+                message=message,
                 excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
             )
         )
+
+    # Sub-check 1b: שיקום ושדרוג (מימון עצמי) — Column R, rows 28, 29, 30
+    for i, excel_row in enumerate((28, 29, 30)):
+        label = ROW_LABELS[i]
+        df_idx = excel_row_to_df_index(excel_row, cfg)
+        val = get_cell(plan_df, df_idx, cfg.value_col_r_idx)
+        has_value = val is not None and not (isinstance(val, float) and pd.isna(val))
+        if has_value and isinstance(val, (int, float)):
+            try:
+                has_value = float(val) != 0
+            except (TypeError, ValueError):
+                pass
+        elif has_value:
+            has_value = str(val).strip() not in ("", "0")
+
+        status = Status.PASS_ if has_value else Status.FAIL
+        message = f"שיקום ושדרוג מימון עצמי ({label}) R{excel_row}: {'ערך קיים' if has_value else 'חסר ערך'}"
+        try:
+            actual_val = round(float(val), 2) if val is not None else None
+        except (TypeError, ValueError):
+            actual_val = val
+        results.append(
+            CheckResult(
+                rule_id=f"R_4_שיקום_{label.replace(chr(34), '')}",
+                rule_name='מינימום נדרש / שיקום ושדרוג',
+                severity=Severity.CRITICAL,
+                sheet_name=cfg.sheet_name,
+                row_index=df_idx,
+                column_name="R",
+                key_context=f"plan_cell=R{excel_row}; שיקום ושדרוג מימון עצמי",
+                actual_value=actual_val,
+                expected_value="ערך קיים",
+                status=status,
+                message=message,
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "R")],
+            )
+        )
+
+    # Sub-check 2: Ratio in Column S rows 28,29,30 — stored as ratio (e.g. 2.44 = 244%); must be > 100%
+    for i, excel_row in enumerate((28, 29, 30)):
+        label = ROW_LABELS[i]
+        df_idx = excel_row_to_df_index(excel_row, cfg)
+        raw = get_cell(plan_df, df_idx, cfg.value_col_s_idx)
+        try:
+            ratio_val = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            ratio_val = None
+
+        if ratio_val is None:
+            status = Status.FAIL
+            message = f"יחס מינימום נדרש לשיקום ושדרוג ({label}) S{excel_row}: חסר או לא חוקי. נדרש מעל 100%"
+            actual_value = raw
+            expected_value = "> 100%"
+        else:
+            pct_val = ratio_val * 100  # convert ratio to percent (2.44 -> 244.2)
+            pct_display = round(pct_val, 1)
+            ok = pct_val > 100
+            status = Status.PASS_ if ok else Status.FAIL
+            actual_value = f"{pct_display}%"
+            expected_value = "> 100%"
+            if ok:
+                message = f"יחס מינימום נדרש לשיקום ושדרוג ({label}): {pct_display}%"
+            else:
+                message = f"יחס מינימום נדרש לשיקום ושדרוג ({label}) הוא {pct_display}%. מתחת ל-100% דורש בירור"
+
+        results.append(
+            CheckResult(
+                rule_id=f"R_4_יחס_{label.replace(chr(34), '')}",
+                rule_name='יחס נכסים',
+                severity=Severity.CRITICAL,
+                sheet_name=cfg.sheet_name,
+                row_index=df_idx,
+                column_name="S",
+                key_context=f"plan_cell=S{excel_row}; ratio מינימום נדרש לשיקום ושדרוג",
+                actual_value=actual_value,
+                expected_value=expected_value,
+                status=status,
+                message=message,
+                excel_cells=[_summary_sheet_cell(cfg, excel_row, "S")],
+            )
+        )
+
     return results
 
 
+
+
+def check_005_total_planned_investments_cross_row(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    R_5: דיווח סה"כ השקעות מתוכננות לביצוע.
+
+    Cross-row check for columns C–Q (indices 2–16): Row 4 = city name, Row 39 = investment value.
+    If Row 4 has a city name, Row 39 MUST have a valid non-zero numerical value.
+    """
+    ROW_CITY = 4
+    ROW_INVESTMENT = 39
+    COL_START, COL_END = 2, 17  # C=2 through Q=16
+
+    df_idx_4 = excel_row_to_df_index(ROW_CITY, cfg)
+    df_idx_39 = excel_row_to_df_index(ROW_INVESTMENT, cfg)
+    failed_cities: List[str] = []
+
+    for col_idx in range(COL_START, COL_END):
+        city_name = get_cell(plan_df, df_idx_4, col_idx)
+        value = get_cell(plan_df, df_idx_39, col_idx)
+
+        has_city = (
+            city_name is not None
+            and not (isinstance(city_name, float) and pd.isna(city_name))
+            and str(city_name).strip() != ""
+        )
+        if not has_city:
+            continue
+
+        city_str = str(city_name).strip()
+        valid_value = False
+        if value is not None and not (isinstance(value, float) and pd.isna(value)) and str(value).strip() != "":
+            try:
+                n = float(value)
+                valid_value = n != 0
+            except (TypeError, ValueError):
+                pass
+        if not valid_value:
+            failed_cities.append(city_str)
+
+    status = Status.FAIL if failed_cities else Status.PASS_
+    if failed_cities:
+        parts = [f'לישוב {city} אין דיווח סה"כ מתוכננות לפרויקטים מתוכננים' for city in failed_cities]
+        message = "נכשל - במידה והערך לא עומד בתנאי יש להציג הודעה: " + "; ".join(parts)
+        actual_value = failed_cities
+        expected_value = "ערך מספרי לא ריק ולא 0 בשורה 39 לכל יישוב"
+    else:
+        message = "תקין - לכל היישובים המדווחים קיים ערך בשורה 39."
+        actual_value = "כל היישובים תקינים"
+        expected_value = "ערך מספרי לא ריק ולא 0 בשורה 39 לכל יישוב"
+
+    col_letters = "C–Q"
+    excel_cells = [_summary_sheet_cell(cfg, ROW_INVESTMENT, _col_idx_to_letter(c)) for c in range(COL_START, COL_END)]
+    results: List[CheckResult] = [
+        CheckResult(
+            rule_id="R_5",
+            rule_name='דיווח סה"כ השקעות מתוכננות לביצוע',
+            severity=Severity.CRITICAL,
+            sheet_name=cfg.sheet_name,
+            row_index=df_idx_39,
+            column_name=col_letters,
+            key_context=f"row_4=יישוב; row_39=ערך השקעה; עמודות {col_letters}",
+            actual_value=actual_value,
+            expected_value=expected_value,
+            status=status,
+            message=message,
+            excel_cells=excel_cells,
+        )
+    ]
+    return results
 
 
 def check_005_min_required_program(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
@@ -361,6 +605,120 @@ def check_005_min_required_program(plan_df: pd.DataFrame, cfg: PlanConfig) -> Li
         )
 
     return results
+
+
+def _sync_investment_funding_scan(plan_df: pd.DataFrame, cfg: PlanConfig) -> tuple[list[str], list[str]]:
+    """
+    Scan columns C–Q (2–16): row 4 = city, row 39 = investment, row 50 = budget.
+    Returns (missing_sources_failures, deficit_failures) where each is a list of error messages.
+    """
+    ROW_CITY, ROW_INVESTMENT, ROW_BUDGET = 4, 39, 50
+    COL_START, COL_END = 2, 17
+
+    df_idx_4 = excel_row_to_df_index(ROW_CITY, cfg)
+    df_idx_39 = excel_row_to_df_index(ROW_INVESTMENT, cfg)
+    df_idx_50 = excel_row_to_df_index(ROW_BUDGET, cfg)
+
+    missing_sources: list[str] = []
+    deficit: list[str] = []
+
+    for col_idx in range(COL_START, COL_END):
+        city_name = get_cell(plan_df, df_idx_4, col_idx)
+        has_city = (
+            city_name is not None
+            and not (isinstance(city_name, float) and pd.isna(city_name))
+            and str(city_name).strip() != ""
+        )
+        if not has_city:
+            continue
+
+        city_str = str(city_name).strip()
+        inv_raw = get_cell(plan_df, df_idx_39, col_idx)
+        bud_raw = get_cell(plan_df, df_idx_50, col_idx)
+
+        try:
+            inv_val = float(inv_raw) if inv_raw is not None and not (isinstance(inv_raw, float) and pd.isna(inv_raw)) and str(inv_raw).strip() != "" else None
+        except (TypeError, ValueError):
+            inv_val = None
+        try:
+            bud_val = float(bud_raw) if bud_raw is not None and not (isinstance(bud_raw, float) and pd.isna(bud_raw)) and str(bud_raw).strip() != "" else None
+        except (TypeError, ValueError):
+            bud_val = None
+
+        # R_6: Row 50 empty, null, or 0
+        if bud_val is None or bud_val == 0:
+            missing_sources.append(f"לא קיים ערך של מקורות תקציב עבור רשות מקומית {city_str}")
+
+        # R_7: Both exist, investment > budget
+        if inv_val is not None and bud_val is not None and bud_val != 0:
+            if inv_val - bud_val > 0:
+                deficit.append(f"אין מספיק מקורות מימון - רשות מקומית {city_str}")
+
+    return missing_sources, deficit
+
+
+def check_006_sync_budget_sources_missing(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    R_6: בדיקת סנכרון השקעות ומקורות מימון.
+    Sub-Check A: For each city in row 4 (columns C–Q), row 50 (Total Budget) must not be empty/null/0.
+    """
+    missing_sources, _ = _sync_investment_funding_scan(plan_df, cfg)
+    ROW_BUDGET = 50
+    COL_START, COL_END = 2, 17
+
+    status = Status.FAIL if missing_sources else Status.PASS_
+    message = "; ".join(missing_sources) if missing_sources else "תקין - לכל היישובים קיים ערך מקורות תקציב בשורה 50."
+    df_idx_50 = excel_row_to_df_index(ROW_BUDGET, cfg)
+    excel_cells = [_summary_sheet_cell(cfg, ROW_BUDGET, _col_idx_to_letter(c)) for c in range(COL_START, COL_END)]
+
+    return [
+        CheckResult(
+            rule_id="R_6",
+            rule_name="בדיקת סנכרון השקעות ומקורות מימון",
+            severity=Severity.CRITICAL,
+            sheet_name=cfg.sheet_name,
+            row_index=df_idx_50,
+            column_name="C–Q",
+            key_context="row_4=יישוב; row_50=מקורות תקציב; עמודות C–Q",
+            actual_value=missing_sources if missing_sources else "כל היישובים עם ערך מקורות תקציב",
+            expected_value="ערך מקורות תקציב לא ריק ולא 0 לכל יישוב",
+            status=status,
+            message=message,
+            excel_cells=excel_cells,
+        )
+    ]
+
+
+def check_007_sync_budget_deficit(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    R_7: בדיקת סנכרון השקעות ומקורות מימון.
+    Sub-Check B: For each city, if both row 39 (investment) and row 50 (budget) exist, investment must not exceed budget.
+    """
+    _, deficit = _sync_investment_funding_scan(plan_df, cfg)
+    ROW_INVESTMENT, ROW_BUDGET = 39, 50
+    COL_START, COL_END = 2, 17
+
+    status = Status.FAIL if deficit else Status.PASS_
+    message = "; ".join(deficit) if deficit else "תקין - מקורות המימון מכסים את ההשקעות המתוכננות לכל יישוב."
+    df_idx_39 = excel_row_to_df_index(ROW_INVESTMENT, cfg)
+    excel_cells = [_summary_sheet_cell(cfg, ROW_INVESTMENT, _col_idx_to_letter(c)) for c in range(COL_START, COL_END)]
+
+    return [
+        CheckResult(
+            rule_id="R_7",
+            rule_name="בדיקת סנכרון השקעות ומקורות מימון",
+            severity=Severity.CRITICAL,
+            sheet_name=cfg.sheet_name,
+            row_index=df_idx_39,
+            column_name="C–Q",
+            key_context="row_39=השקעה מתוכננת; row_50=מקורות תקציב; עמודות C–Q",
+            actual_value=deficit if deficit else "מקורות מימון מכסים את ההשקעות",
+            expected_value="מקורות מימון >= השקעה מתוכננת לכל יישוב",
+            status=status,
+            message=message,
+            excel_cells=excel_cells,
+        )
+    ]
 
 
 def check_006_rehab_upgrade_min_required(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
@@ -429,6 +787,84 @@ def check_007_total_planned_investments_by_city(plan_df: pd.DataFrame, cfg: Plan
     return results
 
 
+def check_008_pipe_lengths_water(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    R_8: דיווח אורכי צנרת מים.
+    For each column C–Q: row 4 = city. Skip 'כפר סבא'. For other cities, at least one of row 56 or 57
+    must have a valid non-zero numerical value (pipe length). FAIL if both 56 and 57 are empty/zero.
+    """
+    ROW_CITY, ROW_56, ROW_57 = 4, 56, 57
+    COL_START, COL_END = 2, 17
+    SKIP_CITY = "כפר סבא"
+
+    df_idx_4 = excel_row_to_df_index(ROW_CITY, cfg)
+    df_idx_56 = excel_row_to_df_index(ROW_56, cfg)
+    df_idx_57 = excel_row_to_df_index(ROW_57, cfg)
+
+    failed_cities: List[str] = []
+
+    for col_idx in range(COL_START, COL_END):
+        city_name = get_cell(plan_df, df_idx_4, col_idx)
+        has_city = (
+            city_name is not None
+            and not (isinstance(city_name, float) and pd.isna(city_name))
+            and str(city_name).strip() != ""
+        )
+        if not has_city:
+            continue
+
+        city_str = str(city_name).strip()
+        if city_str == SKIP_CITY:
+            continue
+
+        v56 = get_cell(plan_df, df_idx_56, col_idx)
+        v57 = get_cell(plan_df, df_idx_57, col_idx)
+
+        def valid_num(val: Any) -> bool:
+            if val is None or (isinstance(val, float) and pd.isna(val)) or str(val).strip() == "":
+                return False
+            try:
+                return float(val) != 0
+            except (TypeError, ValueError):
+                return False
+
+        if not valid_num(v56) and not valid_num(v57):
+            failed_cities.append(city_str)
+
+    status = Status.FAIL if failed_cities else Status.PASS_
+    if failed_cities:
+        parts = [f"לישוב {c} חסר דיווח אורכי צנרת מים (שורה 56 או 57)" for c in failed_cities]
+        message = "נכשל - " + "; ".join(parts)
+        actual_value = failed_cities
+        expected_value = "ערך לא ריק ולא 0 בשורה 56 או 57 לכל יישוב (מלבד כפר סבא)"
+    else:
+        message = "תקין - לכל היישובים הנדרשים קיים דיווח אורכי צנרת מים (שורה 56 או 57)."
+        actual_value = "כל היישובים דיווחו"
+        expected_value = "ערך לא ריק ולא 0 בשורה 56 או 57 לכל יישוב (מלבד כפר סבא)"
+
+    excel_cells = []
+    for r in (ROW_56, ROW_57):
+        for c in range(COL_START, COL_END):
+            excel_cells.append(_summary_sheet_cell(cfg, r, _col_idx_to_letter(c)))
+
+    return [
+        CheckResult(
+            rule_id="R_8",
+            rule_name="דיווח אורכי צנרת מים",
+            severity=Severity.CRITICAL,
+            sheet_name=cfg.sheet_name,
+            row_index=df_idx_56,
+            column_name="C–Q",
+            key_context="row_4=יישוב; row_56,57=אורכי צנרת מים; עמודות C–Q; כפר סבא מדולג",
+            actual_value=actual_value,
+            expected_value=expected_value,
+            status=status,
+            message=message,
+            excel_cells=excel_cells,
+        )
+    ]
+
+
 def check_008_funding_total_and_exists_by_city(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
     """
     City columns: check row funding_total_row_excel exists/non-empty per city.
@@ -464,6 +900,76 @@ def check_008_funding_total_and_exists_by_city(plan_df: pd.DataFrame, cfg: PlanC
             )
         )
     return results
+
+
+def check_009_pipe_lengths_sewer(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
+    """
+    R_9: דיווח אורכי צנרת ביוב.
+    For each column C–Q: row 4 = city. Skip 'כפר סבא'. For other cities, row 58 must have
+    a valid non-zero numerical value (sewage pipe length). FAIL if row 58 is empty or zero.
+    """
+    ROW_CITY, ROW_58 = 4, 58
+    COL_START, COL_END = 2, 17
+    SKIP_CITY = "כפר סבא"
+
+    df_idx_4 = excel_row_to_df_index(ROW_CITY, cfg)
+    df_idx_58 = excel_row_to_df_index(ROW_58, cfg)
+
+    failed_cities: List[str] = []
+
+    for col_idx in range(COL_START, COL_END):
+        city_name = get_cell(plan_df, df_idx_4, col_idx)
+        has_city = (
+            city_name is not None
+            and not (isinstance(city_name, float) and pd.isna(city_name))
+            and str(city_name).strip() != ""
+        )
+        if not has_city:
+            continue
+
+        city_str = str(city_name).strip()
+        if city_str == SKIP_CITY:
+            continue
+
+        v58 = get_cell(plan_df, df_idx_58, col_idx)
+        valid = False
+        if v58 is not None and not (isinstance(v58, float) and pd.isna(v58)) and str(v58).strip() != "":
+            try:
+                valid = float(v58) != 0
+            except (TypeError, ValueError):
+                pass
+        if not valid:
+            failed_cities.append(city_str)
+
+    status = Status.FAIL if failed_cities else Status.PASS_
+    if failed_cities:
+        parts = [f"לישוב {c} חסר דיווח אורכי צנרת ביוב (שורה 58)" for c in failed_cities]
+        message = "נכשל - " + "; ".join(parts)
+        actual_value = failed_cities
+        expected_value = "ערך לא ריק ולא 0 בשורה 58 לכל יישוב (מלבד כפר סבא)"
+    else:
+        message = "תקין - לכל היישובים הנדרשים קיים דיווח אורכי צנרת ביוב (שורה 58)."
+        actual_value = "כל היישובים דיווחו"
+        expected_value = "ערך לא ריק ולא 0 בשורה 58 לכל יישוב (מלבד כפר סבא)"
+
+    excel_cells = [_summary_sheet_cell(cfg, ROW_58, _col_idx_to_letter(c)) for c in range(COL_START, COL_END)]
+
+    return [
+        CheckResult(
+            rule_id="R_9",
+            rule_name="דיווח אורכי צנרת ביוב",
+            severity=Severity.CRITICAL,
+            sheet_name=cfg.sheet_name,
+            row_index=df_idx_58,
+            column_name="C–Q",
+            key_context="row_4=יישוב; row_58=אורכי צנרת ביוב; עמודות C–Q; כפר סבא מדולג",
+            actual_value=actual_value,
+            expected_value=expected_value,
+            status=status,
+            message=message,
+            excel_cells=excel_cells,
+        )
+    ]
 
 
 def check_010_pipes_any_value(plan_df: pd.DataFrame, cfg: PlanConfig) -> List[CheckResult]:
@@ -4565,12 +5071,18 @@ INVALID_PROJECT_REGEXES = [
 
 __all__ = [
     "check_001_kinun_values_rounded",
-    "check_rule02_03_asset_ratio",
+    "check_002_asset_ratio",
+    "check_003_defined_value_percent",
     "check_004_total_program_values",
     "check_005_min_required_program",
+    "check_005_total_planned_investments_cross_row",
     "check_006_rehab_upgrade_min_required",
+    "check_006_sync_budget_sources_missing",
+    "check_007_sync_budget_deficit",
     "check_007_total_planned_investments_by_city",
     "check_008_funding_total_and_exists_by_city",
+    "check_008_pipe_lengths_water",
+    "check_009_pipe_lengths_sewer",
     "check_010_pipes_any_value",
     "check_011_pipes_values_by_type",
     "check_012_project_fields_not_empty",

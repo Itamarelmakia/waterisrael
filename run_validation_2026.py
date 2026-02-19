@@ -51,7 +51,7 @@ def main():
 
     checks_list = [
         checks.check_001_kinun_values_rounded,
-        checks.check_rule02_03_asset_ratio,
+        checks.check_002_asset_ratio,
         checks.check_004_total_program_values,
         checks.check_005_min_required_program,
         checks.check_006_rehab_upgrade_min_required,
