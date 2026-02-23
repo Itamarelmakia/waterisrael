@@ -33,3 +33,32 @@ dist/
 waterisrael-ui/dist/
 .env
 waterisrael-ui/.env*
+
+
+# --- קבצי מערכת וזבל של אופיס ---
+# קבצים זמניים של PowerPoint/Word (כמו ~$Rule14)
+~$*
+# קבצי מערכת של Windows/Mac
+Thumbs.db
+.DS_Store
+
+# --- הגדרות אישיות של כלי AI ועורכי קוד ---
+# הגדרות של Claude ו-Cursor (כמו ה-.claude שראינו)
+.claude/
+.cursor/
+.vscode/
+
+# --- סביבת עבודה של פייתון (Python) ---
+# סביבה וירטואלית
+.venv/
+venv/
+env/
+# קבצי זיכרון זמניים
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# --- תוצרי ריצה (Outputs) ---
+# מומלץ לא להעלות את קבצי האקסל שנוצרים מההרצה
+outputs/
+*.log
