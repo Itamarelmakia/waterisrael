@@ -19,30 +19,29 @@ from .excel_io import load_kinun_reference, load_plan_sheet_with_header_fix,load
 from .utils import extract_utility_from_plan_filename
 
 from .checks import (
+    # ── Macro summary (R_1–R_4) ──────────────────────────────────────────────
     check_001_kinun_values_rounded,
     check_002_asset_ratio,
     check_003_defined_value_percent,
     check_004_total_program_values,
-    check_005_min_required_program,
+    # ── Standardised city checks (R_5–R_9) ───────────────────────────────────
     check_005_total_planned_investments_cross_row,
-    check_006_rehab_upgrade_min_required,
     check_006_sync_budget_sources_missing,
-    check_007_total_planned_investments_by_city,
     check_007_sync_budget_deficit,
-    check_008_funding_total_and_exists_by_city,
     check_008_pipe_lengths_water,
     check_009_pipe_lengths_sewer,
-    check_010_pipes_any_value,
-    check_011_pipes_values_by_type,
+    # ── Project-level checks (R_12–R_25) ─────────────────────────────────────
     check_012_project_fields_not_empty,
     check_014_llm_project_funding_classification,
     check_015_invalid_project_names,
+    check_016_wells_classification,
     check_018_facility_rehab_upgrade,
     check_019_total_planned_cost_per_project,
     check_020_project_status_planning_report,
     check_021_diameter_jump_matching_row,
     check_023_pipe_cost_rule_of_thumb,
     check_024_short_pipe_projects_ratio,
+    check_025_pipe_delimiter_colon_only,
     load_kinun_store,
 )
 
@@ -140,19 +139,20 @@ def run_summary_sheet_checks(
 
 
     results = []
+    print("Validation rules: R_1–R_9, R_12–R_25 (R_10,R_11 disabled)")
 
-    # ---- Summary sheet rules ----
-    _run_rule("R_1",   lambda: check_001_kinun_values_rounded(plan_df, kinun_store, utility, cfg, kinun_year=kinun_year))
+    # ── Macro summary ─────────────────────────────────────────────────────────
+    _run_rule("R_1", lambda: check_001_kinun_values_rounded(plan_df, kinun_store, utility, cfg, kinun_year=kinun_year))
     _run_rule("R_2", lambda: check_002_asset_ratio(plan_df, cfg))
     _run_rule("R_3", lambda: check_003_defined_value_percent(plan_df, cfg))
-    _run_rule("R_4",   lambda: check_004_total_program_values(plan_df, cfg))
-    _run_rule("R_5",   lambda: check_005_total_planned_investments_cross_row(plan_df, cfg))
-    _run_rule("R_6",   lambda: check_006_sync_budget_sources_missing(plan_df, cfg))
-    _run_rule("R_7",   lambda: check_007_sync_budget_deficit(plan_df, cfg))
-    _run_rule("R_8",   lambda: check_008_pipe_lengths_water(plan_df, cfg))
-    _run_rule("R_9",   lambda: check_009_pipe_lengths_sewer(plan_df, cfg))
-    _run_rule("R_10",  lambda: check_010_pipes_any_value(plan_df, cfg))
-    _run_rule("R_11",  lambda: check_011_pipes_values_by_type(plan_df, cfg))
+    _run_rule("R_4", lambda: check_004_total_program_values(plan_df, cfg))
+    # ── Standardised city checks ──────────────────────────────────────────────
+    _run_rule("R_5", lambda: check_005_total_planned_investments_cross_row(plan_df, cfg))
+    _run_rule("R_6", lambda: check_006_sync_budget_sources_missing(plan_df, cfg))
+    _run_rule("R_7", lambda: check_007_sync_budget_deficit(plan_df, cfg))
+    _run_rule("R_8", lambda: check_008_pipe_lengths_water(plan_df, cfg))
+    _run_rule("R_9", lambda: check_009_pipe_lengths_sewer(plan_df, cfg))
+    # R_10 and R_11 disabled — removed from active rule set
 
     report_df = load_report_sheet(
         str(plan_file),
@@ -160,17 +160,18 @@ def run_summary_sheet_checks(
         header_row=cfg.report_header_row,
     )
 
-    # ---- Report sheet rules ----
+    # ── Project-level checks ──────────────────────────────────────────────────
     _run_rule("R_12", lambda: check_012_project_fields_not_empty(report_df, cfg))
+    _run_rule("R_14", lambda: check_014_llm_project_funding_classification(report_df, cfg, utility_name=utility))
     _run_rule("R_15", lambda: check_015_invalid_project_names(report_df, cfg))
+    _run_rule("R_16", lambda: check_016_wells_classification(report_df, cfg))
     _run_rule("R_18", lambda: check_018_facility_rehab_upgrade(report_df, cfg))
     _run_rule("R_19", lambda: check_019_total_planned_cost_per_project(report_df, cfg))
     _run_rule("R_20", lambda: check_020_project_status_planning_report(report_df, cfg))
     _run_rule("R_21", lambda: check_021_diameter_jump_matching_row(report_df, cfg))
-
-    _run_rule("R_14", lambda: check_014_llm_project_funding_classification(report_df, cfg, utility_name=utility))
     _run_rule("R_23", lambda: check_023_pipe_cost_rule_of_thumb(report_df, cfg))
     _run_rule("R_24", lambda: check_024_short_pipe_projects_ratio(report_df, cfg))
+    _run_rule("R_25", lambda: check_025_pipe_delimiter_colon_only(report_df, cfg))
 
     # ---- End rules ----
 

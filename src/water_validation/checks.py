@@ -2457,20 +2457,11 @@ def check_015_invalid_project_names(
     cfg: PlanConfig,
 ) -> List[CheckResult]:
     """
-    R15 - "שמות פרויקטים לא תקינים"
+    R_15 — שמות פרויקטים לא תקינים (raw row level).
 
-    Input:
-      - report_df: DataFrame של "גיליון דיווח"
-      - cfg: PlanConfig (כולל report_project_id_col_norm, report_header_row וכו')
-
-    What it checks:
-      - בעמודות "שם פרויקט" ו-"מיקום פרויקט" אין ערכים כלליים מדי כמו:
-        "רחוב", "בין הבתים", "שטח פתוח", "רחוב שכונת"
-      - בעמודה "מיקום פרויקט" יש תא-עזר שמופיע תחת הכותרת בגלל header דו-שורתי:
-        "רחוב/שכונה/תב\"ע" -> את זה חייבים לדלג (זה לא נתון אמיתי)
-
-    Output:
-      - List[CheckResult] (רק FAILים; בלי PASS כדי לא לנפח Output)
+    One CheckResult per row. For each real row, checks "שם פרויקט" and "מיקום פרויקט":
+    values must not be generic ("רחוב", "בין הבתים", "שטח פתוח", "רחוב שכונת" etc.).
+    Skips location-helper text "רחוב/שכונה/תב\"ע". Emits PASS or FAIL per row.
     """
 
 
@@ -2503,7 +2494,6 @@ def check_015_invalid_project_names(
     RULE_ID = "R_15"
     RULE_NAME = "שמות פרויקטים לא תקינים"
     SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
-    EMIT_PASS_ROWS = True  # debug mode: include PASS rows too
 
     # ---- Patterns ----
     INVALID_PROJECT_TEXTS = {
@@ -2582,54 +2572,80 @@ def check_015_invalid_project_names(
                 severity=Severity.WARNING,
                 sheet_name=SHEET,
                 status=Status.FAIL,
+                message=f"חסרות עמודות נדרשות לבדיקה: {', '.join(missing_cols)}",
+                row_index=None,
                 column_name=" / ".join(missing_cols),
                 key_context="columns_presence",
-                message=f"חסרות עמודות נדרשות לבדיקה: {', '.join(missing_cols)}",
             )
         )
         return results
 
-    # ---- Data rows mask (same idea as Rule 12) ----
     id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
     id_col = _resolve_required(id_norm)
-    if id_col is None:
-        # אם אין מס' פרויקט, נריץ “על הכל” אבל עדיין נדלג על שורות ריקות
-        data_df = report_df.copy()
-    else:
-        id_series = report_df[id_col].astype(str).str.strip()
-        data_mask = (
-            report_df[id_col].notna()
-            & (id_series != "-")
-            & (id_series.str.lower() != "nan")
-            & (id_series != "")
-        )
-        data_df = report_df.loc[data_mask].copy()
+    header_row = getattr(cfg, "report_header_row", 6)
+    excel_row_offset = header_row + 3
 
-    #print("R15 DEBUG: rows total =", len(report_df), "rows after mask =", len(data_df))
-    #print("R15 DEBUG: resolved cols =", resolved_map)
+    def _is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
 
-    # ---- Iterate ----
-    for idx, row in data_df.iterrows():
+    def _is_real_row(df_i: int) -> bool:
+        if id_col is None:
+            return True
+        v = report_df.at[df_i, id_col]
+        if _is_empty(v):
+            return False
+        s = str(v).strip()
+        return s not in {"-", ""} and s.lower() != "nan"
+
+    def _is_invalid_value(val_str: str) -> bool:
+        if not val_str or val_str.lower() in {"nan", "none"}:
+            return False
+        norm = normalize_text(val_str)
+        return (norm in INVALID_PROJECT_TEXTS) or any(rx.match(norm) for rx in INVALID_PROJECT_REGEXES)
+
+    for i in range(len(report_df)):
+        if not _is_real_row(i):
+            continue
+        excel_row = int(i + excel_row_offset)
+        pid = str(report_df.at[i, id_col]).strip() if id_col else ""
+        errors: List[str] = []
         for logical_col, actual_df_col in resolved_map.items():
-            raw_val = row.get(actual_df_col, None)
+            raw_val = report_df.at[i, actual_df_col]
             if raw_val is None:
                 continue
-
             val_str = str(raw_val).strip()
             if val_str == "" or val_str.lower() in {"nan", "none"}:
-                continue  # empties handled by Rule 12
-
-            # Skip the helper cell under the 2-row header in "מיקום פרויקט"
+                continue
             if logical_col == "מיקום פרויקט" and val_str in LOCATION_HELPER_TEXTS:
                 continue
-
-            norm = normalize_text(val_str)
-
-            is_invalid = (norm in INVALID_PROJECT_TEXTS) or any(rx.match(norm) for rx in INVALID_PROJECT_REGEXES)
-            """
-            if not is_invalid:
-                continue  # only failures
-
+            if _is_invalid_value(val_str):
+                errors.append(f"{logical_col}: ערך כללי מדי ({val_str})")
+        if not errors:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.PASS_,
+                    message="תקין",
+                    row_index=excel_row,
+                    column_name=None,
+                    key_context=f"ID={pid}",
+                    actual_value="תקין",
+                    expected_value="תיאור פרויקט מפורט",
+                )
+            )
+        else:
+            msg = "נכשל: " + "; ".join(errors)
             results.append(
                 CheckResult(
                     rule_id=RULE_ID,
@@ -2637,58 +2653,14 @@ def check_015_invalid_project_names(
                     severity=Severity.WARNING,
                     sheet_name=SHEET,
                     status=Status.FAIL,
-                    row_index=int(idx),
-                    # IMPORTANT: show logical column name only (no Unnamed...)
-                    column_name=logical_col,
-                    actual_value=val_str,
-                    expected_value='תיאור פרויקט מפורט (לא "רחוב"/"בין הבתים"/"שטח פתוח"/"רחוב שכונה")',
-                    confidence=1.0,
-                    method="Pattern",
-                    message='ערך כללי מדי / לא תקין. יש להזין תיאור פרויקט מלא (לא "רחוב"/"בין הבתים"/"שטח פתוח"/"רחוב שכונה").',
+                    message=msg,
+                    row_index=excel_row,
+                    column_name="שם פרויקט / מיקום פרויקט",
+                    key_context=f"ID={pid}",
+                    actual_value="; ".join(errors),
+                    expected_value='תיאור מפורט (לא "רחוב"/"בין הבתים"/"שטח פתוח"/"רחוב שכונה")',
                 )
             )
-            """
-
-            is_invalid = (norm in INVALID_PROJECT_TEXTS) or any(
-                rx.match(norm) for rx in INVALID_PROJECT_REGEXES
-            )
-
-            if is_invalid:
-                results.append(
-                    CheckResult(
-                        rule_id=RULE_ID,
-                        rule_name=RULE_NAME,
-                        severity=Severity.WARNING,
-                        sheet_name=SHEET,
-                        status=Status.FAIL,
-                        row_index=int(idx),
-                        column_name=logical_col,  # show only logical col name
-                        actual_value=val_str,
-                        expected_value='תיאור פרויקט מפורט (לא "רחוב"/"בין הבתים"/"שטח פתוח"/"רחוב שכונה")',
-                        confidence=1.0,
-                        method="Pattern",
-                        message='ערך כללי מדי / לא תקין. יש להזין תיאור פרויקט מלא (לא "רחוב"/"בין הבתים"/"שטח פתוח"/"רחוב שכונה").',
-                    )
-                )
-            else:
-                if EMIT_PASS_ROWS:
-                    results.append(
-                        CheckResult(
-                            rule_id=RULE_ID,
-                            rule_name=RULE_NAME,
-                            severity=Severity.INFO,
-                            sheet_name=SHEET,
-                            status=Status.PASS_,
-                            row_index=int(idx),
-                            column_name=logical_col,
-                            actual_value=val_str,
-                            expected_value="",
-                            confidence=1.0,
-                            method="Pattern",
-                            message="תקין",
-                        )
-                    )
-
 
     return results
 
@@ -2699,13 +2671,13 @@ def check_018_facility_rehab_upgrade(
     """
     R_18 — בדיקת שיקום ושדרוג מתקנים
 
-    Levels (each emitted per real row, PASS + FAIL):
-      1) שנת הקמה: integer, 1960..current_year
-      2) נפח/ספיקה: not empty
-      3) פירוט העבודות (merged across 5 cols): at least one 'X' exists in Q–U
+    One CheckResult per valid row (after gates). Gatekeeper: F = "שיקום ושדרוג" AND
+    G contains "מתקני מים", "מתקני ביוב", or "קידוחים". Aggregated validations:
+    N (1960..current_year), O and P non-empty, at least one X in Q–U. Errors collected
+    and joined with "; "; PASS message "פרויקט תקין", FAIL message "נכשל: ...".
     """
     from datetime import datetime
-    from openpyxl.utils import get_column_letter
+    from openpyxl.utils import get_column_letter, column_index_from_string
 
     RULE_BASE = "R_18"
     RULE_NAME = "בדיקת שיקום ושדרוג מתקנים"
@@ -2714,10 +2686,14 @@ def check_018_facility_rehab_upgrade(
     MIN_YEAR = 1960
     CUR_YEAR = datetime.now().year
 
-    # -----------------------------
-    # Column resolution (robust)
-    # -----------------------------
     cols = list(report_df.columns)
+
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
 
     def _norm_col(c: object) -> str:
         s = str(c) if c is not None else ""
@@ -2733,48 +2709,31 @@ def check_018_facility_rehab_upgrade(
         if n and n not in norm_to_orig:
             norm_to_orig[n] = c
 
-    year_key = "שנת הקמה"
-    flow_key = "נפח/ספיקה"
-    details_prefix = "פירוט העבודות"
-
-    # exact OR prefix-match (handles units like 'נפח/ספיקה [מ"ק]/[מק"ש]')
-    year_col = norm_to_orig.get(year_key) or next(
-        (orig for norm, orig in norm_to_orig.items() if norm.startswith(year_key)),
-        None
-    )
-
-    flow_col = norm_to_orig.get(flow_key) or next(
-        (orig for norm, orig in norm_to_orig.items() if norm.startswith(flow_key)),
-        None
-    )
-
-
-
     id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
     id_col = norm_to_orig.get(id_norm)
 
-    # Column F (index 5, 0-based) — סיווג פרויקט
-    col_f = cols[5] if len(cols) > 5 else None
-    # Column G (index 6, 0-based) — קוד הנדסי
-    col_g = cols[6] if len(cols) > 6 else None
-    # Column O (index 14, 0-based) — סוג מתקן
-    col_o = cols[14] if len(cols) > 14 else None
-    col_o_label = _norm_col(col_o) if col_o else "O"
-
-    details_cols = [c for c in cols if _norm_col(c).startswith(details_prefix)]
-    print("R18 resolved:", {"id": id_col, "year": year_col, "flow": flow_col, "col_o": col_o, "details": len(details_cols)})
+    col_f = _col_by_excel_letter("F")
+    col_g = _col_by_excel_letter("G")
+    col_n = _col_by_excel_letter("N")   # שנת הקמה
+    col_o = _col_by_excel_letter("O")   # סוג מתקן
+    col_p = _col_by_excel_letter("P")   # נפח/ספיקה
+    cols_q_to_u = [_col_by_excel_letter(letter) for letter in "QRSTU"]
 
     missing = []
-    if year_col is None:
-        missing.append(year_key)
-    if flow_col is None:
-        missing.append(flow_key)
-    if col_o is None:
-        missing.append("O")
     if id_col is None:
         missing.append(id_norm)
-    if not details_cols:
-        missing.append(details_prefix)
+    if col_f is None:
+        missing.append("F")
+    if col_g is None:
+        missing.append("G")
+    if col_n is None:
+        missing.append("N")
+    if col_o is None:
+        missing.append("O")
+    if col_p is None:
+        missing.append("P")
+    if not all(cols_q_to_u):
+        missing.append("Q-U")
 
     if missing:
         return [
@@ -2784,55 +2743,48 @@ def check_018_facility_rehab_upgrade(
                 severity=Severity.CRITICAL,
                 sheet_name=SHEET,
                 status=Status.FAIL,
-                message=f"Missing required columns (after normalization): {missing}",
+                message=f"Missing required columns: {missing}",
                 actual_value=list(report_df.columns),
-                expected_value=[year_key, flow_key, f"{details_prefix}* (5 cols)"],
+                expected_value=["F", "G", "N", "O", "P", "Q-U"],
                 row_index=None,
                 column_name=None,
                 key_context="columns_presence",
-                excel_cells=None,
             )
         ]
 
-    # -----------------------------
-    # Excel cell mapping for highlighting
-    # -----------------------------
     col_to_excel_letter = {col: get_column_letter(i + 1) for i, col in enumerate(cols)}
-
     header_row = getattr(cfg, "report_header_row", 6)
-    excel_row_offset = header_row + 3  # same convention as R12
+    excel_row_offset = header_row + 3
 
     def _cell_ref(df_i: int, col_name: str) -> Optional[str]:
         letter = col_to_excel_letter.get(col_name)
         if not letter:
             return None
-        excel_row = int(df_i + excel_row_offset)
-        return f"{SHEET}!{letter}{excel_row}"
+        return f"{SHEET}!{letter}{int(df_i + excel_row_offset)}"
 
     def _is_empty(v: object) -> bool:
         if v is None:
             return True
-        if pd.isna(v):
-            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
         if isinstance(v, str) and v.strip() == "":
             return True
         s = str(v).strip()
         return s == "" or s.lower() in {"nan", "none"}
 
     def _is_real_row(df_i: int) -> bool:
+        if id_col is None:
+            return True
         v = report_df.at[df_i, id_col]
         if _is_empty(v):
             return False
         s = str(v).strip()
-        if s in {"-", ""}:
-            return False
-        if s.lower() == "nan":
-            return False
-        return True
-
+        return s not in {"-", ""} and s.lower() != "nan"
 
     results: List[CheckResult] = []
-
     seen_project_ids: set[str] = set()
 
     for i in range(len(report_df)):
@@ -2840,20 +2792,12 @@ def check_018_facility_rehab_upgrade(
             continue
 
         pid = str(report_df.at[i, id_col]).strip()
-
-        # validate each unique project only once
         if pid in seen_project_ids:
             continue
         seen_project_ids.add(pid)
         excel_row = int(i + excel_row_offset)
 
-        # =========================================================
-        # Gate: F must be "שיקום ושדרוג" / "שיקום/שדרוג"
-        # =========================================================
-        _raw_f = report_df.iloc[i, 5] if col_f else ""
-        if isinstance(_raw_f, pd.Series):
-            _raw_f = _raw_f.iloc[0]
-        raw_f = str(_raw_f or "").strip()
+        raw_f = str(report_df.at[i, col_f] if col_f else "").strip()
         f_norm = normalize_text(raw_f)
         f_ok = f_norm in (normalize_text("שיקום ושדרוג"), normalize_text("שיקום/שדרוג"))
         if not f_ok:
@@ -2864,25 +2808,19 @@ def check_018_facility_rehab_upgrade(
                     severity=Severity.INFO,
                     sheet_name=SHEET,
                     status=Status.NOT_APPLICABLE,
-                    row_index=int(i),
+                    message=f"לא רלוונטי: סיווג פרויקט אינו שיקום ושדרוג (F={raw_f or '(ריק)'})",
+                    row_index=excel_row,
                     column_name="F",
-                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    key_context=f"ID={pid}",
                     actual_value=raw_f or "(ריק)",
                     expected_value="שיקום ושדרוג",
-                    message=f"לא רלוונטי: סיווג פרויקט אינו שיקום ושדרוג (F={raw_f or '(ריק)'})",
                 )
             )
             continue
 
-        # =========================================================
-        # Gate: G must be "מתקני מים" or "מתקני ביוב"
-        # =========================================================
-        _raw_g = report_df.iloc[i, 6] if col_g else ""
-        if isinstance(_raw_g, pd.Series):
-            _raw_g = _raw_g.iloc[0]
-        raw_g = str(_raw_g or "").strip()
+        raw_g = str(report_df.at[i, col_g] if col_g else "").strip()
         g_norm = normalize_text(raw_g)
-        g_ok = "מתקני מים" in g_norm or "מתקני ביוב" in g_norm
+        g_ok = "מתקני מים" in g_norm or "מתקני ביוב" in g_norm or "קידוחים" in g_norm
         if not g_ok:
             results.append(
                 CheckResult(
@@ -2891,23 +2829,21 @@ def check_018_facility_rehab_upgrade(
                     severity=Severity.INFO,
                     sheet_name=SHEET,
                     status=Status.NOT_APPLICABLE,
-                    row_index=int(i),
+                    message=f"לא רלוונטי: קוד הנדסי אינו מתקני מים / מתקני ביוב / קידוחים (G={raw_g or '(ריק)'})",
+                    row_index=excel_row,
                     column_name="G",
-                    key_context=f"{id_norm}={pid} | excel_row={excel_row}",
+                    key_context=f"ID={pid}",
                     actual_value=raw_g or "(ריק)",
-                    expected_value="מתקני מים / מתקני ביוב",
-                    message=f"לא רלוונטי: קוד הנדסי אינו מתקני מים או מתקני ביוב (G={raw_g or '(ריק)'})",
+                    expected_value="מתקני מים / מתקני ביוב / קידוחים",
                 )
             )
             continue
 
-        # =========================================================
-        # Level 1 — שנת הקמה
-        # =========================================================
-        raw_year = report_df.at[i, year_col]
-        year_ok = True
-        year_int: Optional[int] = None
+        # --- Row-level validations: aggregate into errors[] then one CheckResult ---
+        errors: List[str] = []
 
+        raw_year = report_df.at[i, col_n]
+        year_ok = True
         if _is_empty(raw_year):
             year_ok = False
         else:
@@ -2917,173 +2853,66 @@ def check_018_facility_rehab_upgrade(
                     year_ok = False
             except Exception:
                 year_ok = False
-
-        year_status = Status.PASS_ if year_ok else Status.FAIL
-        year_sev = Severity.INFO if year_ok else Severity.WARNING
-        year_cells = None
         if not year_ok:
-            ref = _cell_ref(i, year_col)
-            year_cells = [ref] if ref else None
+            errors.append("שנת הקמה לא תקינה או חסרה")
 
-        results.append(
-            CheckResult(
-                rule_id=f"{RULE_BASE}_שנת הקמה",
-                rule_name=RULE_NAME,
-                severity=year_sev,
-                sheet_name=SHEET,
-                status=year_status,
-                row_index=int(i),
-                column_name=year_key,
-                key_context=f"{id_norm}={pid} | excel_row={excel_row} | level=שנת הקמה",
-                actual_value=raw_year,
-                expected_value=f'בין השנים "{MIN_YEAR}-{CUR_YEAR}"',
-                confidence=1.0,
-                method="Range",
-                excel_cells=year_cells,
-                message=(
-                    f"עבר: שנת הקמה={year_int}"
-                    if year_ok
-                    else f"נכשל: שנת הקמה חייב להיות מספר שלם בין {MIN_YEAR} ל-{CUR_YEAR}. ערך בפועל: {raw_year!r}"
-                ),
+        if _is_empty(report_df.at[i, col_o]):
+            errors.append("עמודה O צריכה להיות מלאה")
+
+        if _is_empty(report_df.at[i, col_p]):
+            errors.append("עמודה P צריכה להיות מלאה")
+
+        has_x = False
+        for dc in cols_q_to_u:
+            if dc is None:
+                continue
+            v = report_df.at[i, dc]
+            if not _is_empty(v) and str(v).strip().upper() == "X":
+                has_x = True
+                break
+        if not has_x:
+            errors.append("צריך להיות מסומן X אחד לפחות בעמודות Q עד U")
+
+        if not errors:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_BASE,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.PASS_,
+                    message="פרויקט תקין",
+                    row_index=excel_row,
+                    column_name=None,
+                    key_context=f"ID={pid}",
+                    actual_value="תקין",
+                    expected_value="N,O,P תקינים; X ב-Q–U",
+                )
             )
-        )
-
-        # =========================================================
-        # Level 1b — עמודה O (סוג מתקן): not empty
-        # =========================================================
-        raw_o = report_df.iloc[i, 14] if col_o else None
-        if isinstance(raw_o, pd.Series):
-            raw_o = raw_o.iloc[0]
-        o_ok = not _is_empty(raw_o)
-
-        o_status = Status.PASS_ if o_ok else Status.FAIL
-        o_sev = Severity.INFO if o_ok else Severity.WARNING
-        o_cells = None
-        if not o_ok and col_o:
-            ref = _cell_ref(i, col_o)
-            o_cells = [ref] if ref else None
-
-        results.append(
-            CheckResult(
-                rule_id=f"{RULE_BASE}_{col_o_label}",
-                rule_name=RULE_NAME,
-                severity=o_sev,
-                sheet_name=SHEET,
-                status=o_status,
-                row_index=int(i),
-                column_name=col_o_label,
-                key_context=f"{id_norm}={pid} | excel_row={excel_row} | level={col_o_label}",
-                actual_value=raw_o,
-                expected_value="מכיל ערך",
-                confidence=1.0,
-                method="NotEmpty",
-                excel_cells=o_cells,
-                message=(
-                    f"עבר: {col_o_label}={raw_o!r}"
-                    if o_ok
-                    else f'נכשל: "{col_o_label}" לא יכול להיות ריק.'
-                ),
-            )
-        )
-
-        # =========================================================
-        # Level 2 — נפח/ספיקה
-        # =========================================================
-        raw_flow = report_df.at[i, flow_col]
-        flow_ok = not _is_empty(raw_flow)
-
-        flow_status = Status.PASS_ if flow_ok else Status.FAIL
-        flow_sev = Severity.INFO if flow_ok else Severity.WARNING
-        flow_cells = None
-        if not flow_ok:
-            ref = _cell_ref(i, flow_col)
-            flow_cells = [ref] if ref else None
-
-        results.append(
-            CheckResult(
-                rule_id=f"{RULE_BASE}_נפח/ספיקה",
-                rule_name=RULE_NAME,
-                severity=flow_sev,
-                sheet_name=SHEET,
-                status=flow_status,
-                row_index=int(i),
-                column_name=flow_key,
-                key_context=f"{id_norm}={pid} | excel_row={excel_row} | level=נפח/ספיקה",
-                actual_value=raw_flow,
-                expected_value="מכיל ערך",
-                confidence=1.0,
-                method="NotEmpty",
-                excel_cells=flow_cells,
-                message=(
-                    f"עבר: נפח/ספיקה={raw_flow!r}"
-                    if flow_ok
-                    else 'נכשל: "נפח/ספיקה" לא יכול להיות ריק.'
-                ),
-            )
-        )
-
-        # =========================================================
-        # Level 3 — פירוט העבודות (Q–U): at least one X
-        # =========================================================
-        raw_details = [report_df.at[i, dc] for dc in details_cols]
-
-        def _details_label(col_name: str) -> str:
-            # from "פירוט העבודות א\"מ" -> 'א"מ'
-            n = _norm_col(col_name)
-            n = n.replace(details_prefix, "").strip()
-            return n or col_name
-
-        x_labels = []
-        non_empty_labels = []
-
-        for dc, v in zip(details_cols, raw_details):
-            label = _details_label(dc)
-            if not _is_empty(v):
-                non_empty_labels.append(label)
-            if (not _is_empty(v)) and str(v).strip().upper() == "X":
-                x_labels.append(label)
-
-
-
-        details_ok = len(x_labels) > 0
-
-        details_status = Status.PASS_ if details_ok else Status.FAIL
-        details_sev = Severity.INFO if details_ok else Severity.WARNING
-        details_cells = None
-        if not details_ok:
+        else:
+            msg = "נכשל: " + "; ".join(errors)
             refs = []
-            for dc in details_cols:
-                ref = _cell_ref(i, dc)
-                if ref:
-                    refs.append(ref)
-            details_cells = refs or None
-
-        results.append(
-            CheckResult(
-                rule_id=f"{RULE_BASE}_פירוט העבודות",
-                rule_name=RULE_NAME,
-                severity=details_sev,
-                sheet_name=SHEET,
-                status=details_status,
-                row_index=int(i),
-                column_name=details_prefix,
-                key_context=f"{id_norm}={pid} | excel_row={excel_row} | level=פירוט העבודות | cols={len(details_cols)}",
-                actual_value=(
-                    f"X ב: {', '.join(x_labels)}"
-                    if x_labels
-                    else ("ערכים ריקים" if len(non_empty_labels) == 0 else f"אין X; ערכים קיימים ב: {', '.join(non_empty_labels)}")
-                ),
-                expected_value="לפחות X אחד",
-                confidence=1.0,
-                method="AnyX",
-                excel_cells=details_cells,
-                message=(
-                    "עבר: נמצא לפחות 'X' אחד בפירוט העבודות."
-                    if details_ok
-                    else "נכשל: חייב להיות לפחות 'X' אחד באחד מעמודות פירוט העבודות (Q–U)."
-                ),
+            for dc in [col_n, col_o, col_p] + [c for c in cols_q_to_u if c]:
+                if dc:
+                    r = _cell_ref(i, dc)
+                    if r:
+                        refs.append(r)
+            results.append(
+                CheckResult(
+                    rule_id=RULE_BASE,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    message=msg,
+                    row_index=excel_row,
+                    column_name="N,O,P,Q-U",
+                    key_context=f"ID={pid}",
+                    actual_value="; ".join(errors),
+                    expected_value="שנת הקמה תקינה; O,P מלאות; X ב-Q–U",
+                    excel_cells=refs if refs else None,
+                )
             )
-        )
 
     return results
 
@@ -3558,8 +3387,8 @@ def check_021_diameter_jump_matching_row(
 
     For rows where F == "שיקום ושדרוג":
       Step 1: Parse colon-separated diameters in I (old) and L (new),
-              detect unit, look up grade indices. If any pair jumps > 1
-              grade step, search for a matching row with same C,D,E and
+              detect unit. If any pair has L > I by more than 2" (inch)
+              or 50mm, search for a matching row with same C,D,E and
               F in ("פיתוח", "שדרוג"). FAIL if no match.
       Step 2: When matching row found, verify cost split (AE column)
               matches expected split from diameter ratios.
@@ -3930,9 +3759,10 @@ def check_021_diameter_jump_matching_row(
                 has_unrecognized = True
                 continue
 
-            delta = gl - gi
-            if delta > 1:
-                jumps.append((j, norm_i, norm_l, delta))
+            # Regulator rule: trigger if L > I by more than 2" (inch) or 50mm
+            diff = num_l - num_i
+            if (unit == "inch" and diff > 2.0) or (unit == "mm" and diff > 50.0):
+                jumps.append((j, norm_i, norm_l, diff))
 
         if has_unrecognized and not jumps:
             results.append(
@@ -3972,8 +3802,8 @@ def check_021_diameter_jump_matching_row(
                 nl_norm = None
             gi_dbg = _grade_index(ni, unit) if ni else None
             gl_dbg = _grade_index(nl, unit) if nl else None
-            delta_dbg = (gl_dbg - gi_dbg) if (gi_dbg is not None and gl_dbg is not None) else "?"
-            pair_details.append(f"{ni_lbl}[{gi_dbg}]→{nl_lbl}[{gl_dbg}] Δ{delta_dbg}")
+            diff_dbg = round(nl - ni, 2) if (ni is not None and nl is not None) else "?"
+            pair_details.append(f"{ni_lbl}[{gi_dbg}]→{nl_lbl}[{gl_dbg}] diff={diff_dbg}")
         norm_str = f" | normalized: {', '.join(norm_notes)}" if norm_notes else ""
         pairs_str = "; ".join(pair_details)
 
@@ -3990,8 +3820,8 @@ def check_021_diameter_jump_matching_row(
                     column_name="I/L",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
                     actual_value=f"I={str(raw_i).strip()}, L={str(raw_l).strip()} ({unit})",
-                    expected_value="jump > 1 grade step",
-                    message=f"דילוג: אין קפיצות בקוטר מעל מדרגה אחת | pairs: {pairs_str}{norm_str}",
+                    expected_value="jump > 2\" (or > 50mm)",
+                    message=f"דילוג: אין קפיצת קוטר מעל 2\" / 50mm | pairs: {pairs_str}{norm_str}",
                     excel_cells=[c for c in [_cell_ref(i, col_i), _cell_ref(i, col_l)] if c],
                 )
             )
@@ -4027,7 +3857,7 @@ def check_021_diameter_jump_matching_row(
                 match_row_excel = int(r2 + excel_row_offset)
                 break
 
-        jump_desc = ", ".join(f"{ji[1]}→{ji[2]} (Δ{ji[3]})" for ji in jumps)
+        jump_desc = ", ".join(f"{ji[1]}→{ji[2]} (diff={round(ji[3], 2)})" for ji in jumps)
         sys_note = f"I_list={tokens_i} L_list={tokens_l} unit={unit} jumps=[{jump_desc}]{norm_str}"
 
         # Also capture the matched row's F classification and df index
@@ -4312,19 +4142,16 @@ def check_023_pipe_cost_rule_of_thumb(
     cfg: PlanConfig,
 ) -> List[CheckResult]:
     """
-    R_23 — בדיקת מחיר צנרת לפי כלל אצבע
+    R_23 — בדיקת מחיר צנרת לפי כלל אצבע (מפקח)
 
-    Applies only to rows where column G == "קווי מים".
-    Compares a rule-of-thumb per-meter cost (based on pipe diameter)
-    against the reported contractor cost per meter (AE*1000 / M).
-
-    Formula:
-        estimated_calc    = diameter_inches * 1.2 * 150
-        estimated_contrac = (AE * 1000) / M
-
-    Fail if:
-        estimated_calc < estimated_contrac  OR
-        estimated_contrac > 1.5 * estimated_calc
+    Applies only to rows where column G == "קווי מים" or "קווי ביוב".
+    Regulator formula:
+        Total Cost = Column AE (אלפי ₪)
+        Total Length = Sum of values in Column M (split by :)
+        Cost per meter (₪/m) = (AE * 1000) / Total Length
+        Baseline (₪/m) = 0.15 * 1000 * diameter_inches = 150 * diameter_inches
+        Tolerance: ±20% → allowed [0.8*baseline, 1.2*baseline]
+    Uses max diameter when L has multiple values (e.g. 4:6:8).
     """
     from openpyxl.utils import get_column_letter, column_index_from_string
 
@@ -4634,34 +4461,24 @@ def check_023_pipe_cost_rule_of_thumb(
             )
             continue
 
-        # 7. Calculate — weighted average for multi-value, simple for single
+        # 7. Regulator formula: Cost per meter = (AE*1000)/Total Length; Baseline = 150 * diameter (inches)
+        cost_per_m = (ae_val * 1000) / total_length
+        max_diameter_inch = max(inch_vals)
+        baseline_nis_per_m = 150 * max_diameter_inch  # 0.15 * 1000 * diameter
+        tolerance = 0.20
+        low_bound = (1 - tolerance) * baseline_nis_per_m
+        high_bound = (1 + tolerance) * baseline_nis_per_m
+
         if is_multi:
-            # Length-weighted estimated_calc
-            weighted_sum = 0.0
-            segment_details = []
-            for d_inch, m_v in zip(inch_vals, m_vals):
-                seg_len = m_v if m_v is not None else 0
-                seg_calc = d_inch * 1.2 * 150
-                weighted_sum += seg_calc * seg_len
-                segment_details.append(f"{d_inch}\"×{seg_len}m={round(seg_calc, 1)}")
-            estimated_calc = weighted_sum / total_length
+            segment_details = [f"{d}\"×{m}" for d, m in zip(inch_vals, m_vals) if m is not None]
             conv_suffix = f" | segments: [{', '.join(segment_details)}] | {'; '.join(conv_notes)}" if conv_notes else f" | segments: [{', '.join(segment_details)}]"
-            diam_display = f"weighted({', '.join(str(d) for d in inch_vals)}\")"
+            diam_display = f"max({', '.join(str(d) for d in inch_vals)}\")"
         else:
-            diameter_inch = inch_vals[0]
-            estimated_calc = diameter_inch * 1.2 * 150
             conv_suffix = f" | {conv_notes[0]}" if conv_notes else ""
-            diam_display = f"{diameter_inch}\""
+            diam_display = f"{max_diameter_inch}\""
 
-        # Contractor cost per meter = AE*1000 / total_length
-        estimated_contractor = (ae_val * 1000) / total_length
-
-        calc_round = int(round(estimated_calc))
-        contr_round = int(round(estimated_contractor))
-
-        # 8. Deviation check — pass range: [calc, 1.5*calc]
-        upper_bound = 1.5 * estimated_calc
-        is_fail = (estimated_contractor < estimated_calc) or (estimated_contractor > upper_bound)
+        # 8. Deviation check — pass: cost_per_m in [0.8*baseline, 1.2*baseline]
+        is_fail = cost_per_m < low_bound or cost_per_m > high_bound
 
         refs = []
         for c in [col_l, col_m, col_ae]:
@@ -4669,13 +4486,14 @@ def check_023_pipe_cost_rule_of_thumb(
             if r:
                 refs.append(r)
 
-        expected_range = f"{calc_round}-{int(round(upper_bound))} ₪ (כלל אצבע: {calc_round} ₪)"
+        expected_range = f"{int(round(low_bound))}-{int(round(high_bound))} ₪/מ' (בסיס: 150×קוטר={int(round(baseline_nis_per_m))} ₪/מ', ±20%)"
+        actual_display = {"cost_per_meter_nis": round(cost_per_m, 2), "total_cost_ae": ae_val, "total_length_m": total_length, "diameter_inch": max_diameter_inch, "baseline_nis_per_m": round(baseline_nis_per_m, 2)}
 
         if is_fail:
-            if estimated_contractor < estimated_calc:
-                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) נמוכה מכלל אצבע ({calc_round} ₪)"
+            if cost_per_m < low_bound:
+                fail_reason = f"עלות למטר ({round(cost_per_m, 1)} ₪) נמוכה מתחת לטווח (±20% מבסיס {int(round(baseline_nis_per_m))} ₪)"
             else:
-                fail_reason = f"עלות קבלנית למטר ({contr_round} ₪) חורגת מ-1.5× כלל אצבע ({int(round(upper_bound))} ₪)"
+                fail_reason = f"עלות למטר ({round(cost_per_m, 1)} ₪) מעל הטווח המותר (±20% מבסיס {int(round(baseline_nis_per_m))} ₪)"
 
             results.append(
                 CheckResult(
@@ -4687,7 +4505,7 @@ def check_023_pipe_cost_rule_of_thumb(
                     row_index=int(i),
                     column_name="AE",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value=contr_round,
+                    actual_value=actual_display,
                     expected_value=expected_range,
                     confidence=1.0,
                     method="RuleOfThumb",
@@ -4709,13 +4527,13 @@ def check_023_pipe_cost_rule_of_thumb(
                     row_index=int(i),
                     column_name="AE",
                     key_context=f"{id_norm}={pid} | excel_row={excel_row}",
-                    actual_value=contr_round,
+                    actual_value=actual_display,
                     expected_value=expected_range,
                     confidence=1.0,
                     method="RuleOfThumb",
                     message=(
-                        f"תקין: עלות קבלנית למטר ({contr_round} ₪) "
-                        f"בטווח {calc_round}-{int(round(upper_bound))} ₪ | "
+                        f"תקין: עלות למטר ({round(cost_per_m, 1)} ₪) "
+                        f"בטווח {int(round(low_bound))}-{int(round(high_bound))} ₪/מ' | "
                         f"קוטר={diam_display}{conv_suffix}"
                     ),
                     excel_cells=refs or None,
@@ -4838,6 +4656,28 @@ def check_024_short_pipe_projects_ratio(
                 continue
         return min(vals) if vals else None
 
+    def _extract_length_sum(v: object) -> Optional[float]:
+        """Sum of numeric values in M (split by colon). Used for total length < 100m check."""
+        if _is_empty_scalar(v):
+            return None
+        s = str(v).strip()
+        parts = [t.strip() for t in s.split(":") if t.strip()]
+        vals = []
+        for p in parts:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", p):
+                try:
+                    vals.append(float(p))
+                except Exception:
+                    pass
+        if not vals:
+            nums = re.findall(r"-?\d+(?:\.\d+)?", s)
+            for t in nums:
+                try:
+                    vals.append(float(t))
+                except Exception:
+                    pass
+        return sum(vals) if vals else None
+
     # Resolve project id column by normalized header
     def _norm_col(c: object) -> str:
         s = str(c) if c is not None else ""
@@ -4858,6 +4698,8 @@ def check_024_short_pipe_projects_ratio(
 
     col_m = _col_by_excel_letter("M")
     col_ae = _col_by_excel_letter("AE")
+    col_c = _col_by_excel_letter("C")  # project name for context
+    header_row = getattr(cfg, "report_header_row", 6)
 
     print("R24 resolved:", {"id": id_col, "M": col_m, "AE": col_ae})
 
@@ -4899,6 +4741,7 @@ def check_024_short_pipe_projects_ratio(
 
     sum_total = 0.0
     sum_small = 0.0
+    short_pipe_results: List[CheckResult] = []  # per-row: total length < 100m
 
     any_rows = 0                 # count of real project rows (by id)
     any_small = 0                # count of rows where min(M) < 100 (regardless of AE)
@@ -4914,6 +4757,27 @@ def check_024_short_pipe_projects_ratio(
         any_rows += 1
 
         raw_m = report_df.at[i, col_m]
+        total_length = _extract_length_sum(raw_m)
+        if total_length is not None and total_length < THRESH_M:
+            proj_name = report_df.at[i, col_c] if col_c is not None else report_df.at[i, id_col]
+            excel_row_1based = header_row + 3 + i
+            short_pipe_results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=excel_row_1based,
+                    column_name=col_m,
+                    key_context=str(proj_name) if proj_name is not None else "",
+                    actual_value=total_length,
+                    expected_value=">= 100 (מטרים)",
+                    message="התרעה: קו קצר מ-100 מטר ללא הסבר נלווה",
+                    confidence=1.0,
+                    method="ShortPipeLength",
+                )
+            )
         m_min = _extract_numbers_min(raw_m)
         is_small = (m_min is not None) and (m_min < THRESH_M)
         if is_small:
@@ -4936,7 +4800,7 @@ def check_024_short_pipe_projects_ratio(
             sum_small += ae_num
 
     if any_rows == 0:
-        return [
+        return short_pipe_results + [
             CheckResult(
                 rule_id=RULE_ID,
                 rule_name=RULE_NAME,
@@ -4956,7 +4820,7 @@ def check_024_short_pipe_projects_ratio(
 
     # ALARM: all AE cells empty across all real project rows
     if ae_present_rows == 0:
-        return [
+        return short_pipe_results + [
             CheckResult(
                 rule_id=RULE_ID,
                 rule_name=RULE_NAME,
@@ -4976,7 +4840,7 @@ def check_024_short_pipe_projects_ratio(
 
     # ALARM: AE has content but none numeric/finite
     if ae_numeric_rows == 0:
-        return [
+        return short_pipe_results + [
             CheckResult(
                 rule_id=RULE_ID,
                 rule_name=RULE_NAME,
@@ -4996,7 +4860,7 @@ def check_024_short_pipe_projects_ratio(
 
     # After skipping missing AE rows, still must have a positive denominator
     if (not math.isfinite(sum_total)) or (sum_total <= 0):
-        return [
+        return short_pipe_results + [
             CheckResult(
                 rule_id=RULE_ID,
                 rule_name=RULE_NAME,
@@ -5036,7 +4900,7 @@ def check_024_short_pipe_projects_ratio(
         else f"שגיאה: אחוז הפרויקטים עם אורך צנרת קטן מ-100 מטרים הוא {pct:.2f}% (> 5%){note}"
     )
 
-    return [
+    return short_pipe_results + [
         CheckResult(
             rule_id=RULE_ID,
             rule_name=RULE_NAME,
@@ -5059,6 +4923,239 @@ def check_024_short_pipe_projects_ratio(
     ]
 
 
+def check_025_pipe_delimiter_colon_only(
+    report_df: pd.DataFrame,
+    cfg: PlanConfig,
+) -> List[CheckResult]:
+    """
+    R_25 — Data formatting (גיליון דיווח): In columns J (Existing Dia), K (Existing Length),
+    L (Planned Dia), M (Planned Length), multiple values MUST be separated ONLY by colon ':'.
+    If '+', '/', or '-' appear as separators, flag as Error.
+    Processes from physical Excel row 9 (header_row + 3 when header is on row 6).
+    """
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    RULE_ID = "R_25"
+    RULE_NAME = "מפריד עמודות צנרת - רק נקודתיים"
+    SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
+    cols = list(report_df.columns)
+
+    # Map Excel letters J,K,L,M to dataframe column names by position (handles hidden/shifted cols)
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
+
+    pipe_col_letters = ["J", "K", "L", "M"]
+    pipe_cols = {letter: _col_by_excel_letter(letter) for letter in pipe_col_letters}
+    missing = [letter for letter, c in pipe_cols.items() if c is None]
+    if missing:
+        return [
+            CheckResult(
+                rule_id=f"{RULE_ID}_מבנה",
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name=None,
+                key_context="columns_presence",
+                actual_value=list(report_df.columns),
+                expected_value=pipe_col_letters,
+                message=f"Missing columns: {missing}",
+            )
+        ]
+
+    # Row validation helpers (same as check_021): _norm_col, id_col, _is_real_row
+    def _norm_col(c: object) -> str:
+        s = str(c) if c is not None else ""
+        s = re.sub(r"\s*Unnamed:.*", "", s)
+        s = re.sub(r"_level_\d+", "", s)
+        s = s.replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    norm_to_orig: dict = {}
+    for c in cols:
+        n = _norm_col(c)
+        if n and n not in norm_to_orig:
+            norm_to_orig[n] = c
+
+    id_norm = getattr(cfg, "report_project_id_col_norm", "מס' פרויקט")
+    id_col = norm_to_orig.get(id_norm)
+
+    def _is_empty(v: object) -> bool:
+        if v is None:
+            return True
+        try:
+            if pd.isna(v):
+                return True
+        except Exception:
+            pass
+        if isinstance(v, str) and v.strip() == "":
+            return True
+        s = str(v).strip()
+        return s == "" or s.lower() in {"nan", "none"}
+
+    def _is_real_row(df_i: int) -> bool:
+        if id_col is None:
+            return True
+        v = report_df.at[df_i, id_col]
+        if _is_empty(v):
+            return False
+        s = str(v).strip()
+        return s not in {"-", ""} and s.lower() != "nan"
+
+    # Start row: physical Excel row 9 = header_row + 3 (when header is on row 6)
+    header_row = getattr(cfg, "report_header_row", 6)
+    excel_row_offset = header_row + 3  # first data row in Excel (1-based)
+    col_to_letter = {c: get_column_letter(i + 1) for i, c in enumerate(cols)}
+    forbidden = re.compile(r"[\+\/\-]")
+
+    def _is_empty_cell(raw: object) -> bool:
+        if raw is None:
+            return True
+        if isinstance(raw, float):
+            if pd.isna(raw) or not math.isfinite(raw):
+                return True
+        s = str(raw).strip()
+        if not s or s.lower() in {"nan", "none"}:
+            return True
+        return False
+
+    results: List[CheckResult] = []
+    num_rows = len(report_df)
+    for i in range(num_rows):
+        if not _is_real_row(i):
+            continue
+
+        excel_row = excel_row_offset + i
+        row_has_pipe_data = False
+        row_errors: List[CheckResult] = []
+
+        for letter in pipe_col_letters:
+            col_name = pipe_cols[letter]
+            if col_name is None:
+                continue
+            raw = report_df.at[i, col_name]
+            if _is_empty_cell(raw):
+                continue
+            row_has_pipe_data = True
+            s = str(raw).strip()
+            if forbidden.search(s):
+                cell_ref = f"{col_to_letter.get(col_name, letter)}{excel_row}"
+                row_errors.append(
+                    CheckResult(
+                        rule_id=RULE_ID,
+                        rule_name=RULE_NAME,
+                        severity=Severity.WARNING,
+                        sheet_name=SHEET,
+                        status=Status.FAIL,
+                        row_index=excel_row,
+                        column_name=col_name,
+                        key_context=f"cell={cell_ref}",
+                        actual_value=s,
+                        expected_value="ערכים מרובים מופרדים רק בנקודתיים (:)",
+                        message=f"ערך מכיל מפריד לא חוקי (+ / -) בעמודה {letter}: {s[:80]}",
+                    )
+                )
+
+        results.extend(row_errors)
+        if row_has_pipe_data and not row_errors:
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.INFO,
+                    sheet_name=SHEET,
+                    status=Status.PASS_,
+                    row_index=excel_row,
+                    column_name=None,
+                    key_context=str(report_df.at[i, id_col]).strip() if id_col else "",
+                    actual_value="תקין",
+                    expected_value="מפריד : בלבד",
+                    message="עבר: נתוני צנרת תקינים",
+                )
+            )
+    return results
+
+
+
+def check_016_wells_classification(
+    report_df: pd.DataFrame,
+    cfg: PlanConfig,
+) -> List[CheckResult]:
+    """
+    R_16: If project name (Column C) contains "באר" or "בארות", Column F (סיווג) MUST be
+    "קידוחים" and NOT "מתקני מים".
+    """
+    from openpyxl.utils import get_column_letter, column_index_from_string
+
+    RULE_ID = "R_16"
+    RULE_NAME = "סיווג בארות - קידוחים"
+    SHEET = getattr(cfg, "report_sheet_name", "גיליון דיווח")
+    cols = list(report_df.columns)
+
+    def _col_by_excel_letter(letter: str) -> Optional[str]:
+        idx_1b = column_index_from_string(letter)
+        idx_0b = idx_1b - 1
+        if idx_0b < 0 or idx_0b >= len(cols):
+            return None
+        return cols[idx_0b]
+
+    col_c = _col_by_excel_letter("C")
+    col_f = _col_by_excel_letter("F")
+    if col_c is None or col_f is None:
+        return [
+            CheckResult(
+                rule_id=f"{RULE_ID}_מבנה",
+                rule_name=RULE_NAME,
+                severity=Severity.CRITICAL,
+                sheet_name=SHEET,
+                status=Status.FAIL,
+                row_index=None,
+                column_name=None,
+                key_context="columns_presence",
+                actual_value=list(report_df.columns),
+                expected_value=["C", "F"],
+                message="Missing columns C or F",
+            )
+        ]
+
+    header_row = getattr(cfg, "report_header_row", 6)
+    excel_row_offset = header_row + 3
+
+    results: List[CheckResult] = []
+    for i in range(len(report_df)):
+        name = str(report_df.at[i, col_c] or "").strip()
+        if "באר" not in name and "בארות" not in name:
+            continue
+        raw_f = report_df.at[i, col_f]
+        f_norm = normalize_text(str(raw_f or "").strip())
+        if "קידוח" in f_norm or "קידוחים" in f_norm:
+            continue
+        if "מתקני מים" in f_norm or "מתקן מים" in f_norm:
+            excel_row = excel_row_offset + i
+            results.append(
+                CheckResult(
+                    rule_id=RULE_ID,
+                    rule_name=RULE_NAME,
+                    severity=Severity.WARNING,
+                    sheet_name=SHEET,
+                    status=Status.FAIL,
+                    row_index=excel_row,
+                    column_name=col_f,
+                    key_context=name,
+                    actual_value=str(raw_f),
+                    expected_value="קידוחים",
+                    message='פרויקט המכיל "באר/בארות" חייב להיות מסווג כ"קידוחים" ולא "מתקני מים"',
+                )
+            )
+    return results
+
+
 # Regex catches things like:
 # "רחוב שכונת" / "רחוב שכונה" / "רחוב שכונת ..." where there's no real descriptor
 INVALID_PROJECT_REGEXES = [
@@ -5070,27 +5167,27 @@ INVALID_PROJECT_REGEXES = [
 
 
 __all__ = [
+    # ── Macro summary (R_1–R_4) ───────────────────────────────────────────────
     "check_001_kinun_values_rounded",
     "check_002_asset_ratio",
     "check_003_defined_value_percent",
     "check_004_total_program_values",
-    "check_005_min_required_program",
+    # ── Standardised city checks (R_5–R_9) ────────────────────────────────────
     "check_005_total_planned_investments_cross_row",
-    "check_006_rehab_upgrade_min_required",
     "check_006_sync_budget_sources_missing",
     "check_007_sync_budget_deficit",
-    "check_007_total_planned_investments_by_city",
-    "check_008_funding_total_and_exists_by_city",
     "check_008_pipe_lengths_water",
     "check_009_pipe_lengths_sewer",
-    "check_010_pipes_any_value",
-    "check_011_pipes_values_by_type",
+    # ── Project-level checks (R_12–R_25) ──────────────────────────────────────
     "check_012_project_fields_not_empty",
     "check_014_llm_project_funding_classification",
     "check_015_invalid_project_names",
+    "check_016_wells_classification",
     "check_018_facility_rehab_upgrade",
     "check_019_total_planned_cost_per_project",
     "check_020_project_status_planning_report",
+    "check_021_diameter_jump_matching_row",
+    "check_023_pipe_cost_rule_of_thumb",
     "check_024_short_pipe_projects_ratio",
-
+    "check_025_pipe_delimiter_colon_only",
 ]

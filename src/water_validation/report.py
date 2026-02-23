@@ -33,14 +33,18 @@ RULE_DETAILS = {
     "R_15": "שמות הפרויקטים לא יכולים להיות \"רחוב\" בלבד, \"בין הבתים\", \"שטח פתוח\", \"רחוב שכונת\"",
     "R_16": "במידה ובשם הפרויקט מופיע \"באר\" או \"קידוח\"  -  סיווג הפרויקט צריך להיות \"קידוח\"",
     "R_17": "בדיקה לפי שם הפרויקט האם הוא עומד בתנאים של שיקום/שדרוג / פיתוח והאם הוא עומד בתנאים להיחשב כהשקעה. אם הסיווג אינו מתאים יש לתת על כך הערה לבודק.",
-    "R_18": "עמודה N צריכה להכיל שנת הקמה תקינה\nעמודה P צריכה להיות מלאה\nצריך היות מסומן X אחד לפחות בעמודות Q עד U",
+    "R_18": (
+        "עמודה N צריכה להכיל שנת הקמה תקינה (אם זה פרויקט שהקוד ההנדסי שלו הוא מתקני מים /מתקני ביוב/ קידוחים\n"
+        "עמודות O & P צריכות להיות מלאות\n"
+        "צריך היות מסומן X אחד לפחות בעמודות Q עד U"
+    ),
     "R_19": "AE >= X+AA+AD",
     "R_20": "עמודה AH צריכה מלאה",
     "R_21": "במידה ובסיווג פרויקט \"שיקום ושדרוג\" הקפיצה בקוטר מקיים (I) למתוכן (L) היא ביותר מקפיצה אחת (מדרגות הקפיצה לפי קוטר ווחומר מפורט בגליון חומרים וקטרים)\nעל צריכה להיות שורה נוספת עם שם פרוייקט זהה (וקוד פרויקט שונה) עם אותם פרטים בדיוק .\nלכל שורה יועמסו אחוזי פרויקט שונים בעמודות X,AA,AD וAE - לפי מחשבון \"כלי עזר\"",
     "R_22": "בדיקה שסה\"כ מחיר הצנרת אשר יחושב בהתאם למחירי התקן ולפי הנתונים של חומר מבנה, הקוטר והאורך של הקווים אינו עולה על סכום סה\"כ אומדן הפרויקט.",
     "R_23": "בדיקת מחיר צנרת לפי כלל אצבע: השוואת עלות מחושבת (קוטר×1.2×150) לעלות קבלנית מדווחת (AE×1000/M). רלוונטי רק לקווי מים.",
     "R_24": "סך כל הפרויקטים שאורך הצנרת (עמודה M ) קטן מ 100 לא יעלה על 5% מסה\"כ אומדן הפרויקטים\nעמודה AI - צריכה להכיל הסבר",
-    "R_25": "",
+    "R_25": "בדיקת מפריד בעמודות צנרת (J,K,L,M): ערכים מרובים חייבים להיות מופרדים רק בנקודתיים (:). שימוש ב-+ / - אסור.",
     "R_26": "בדיקה שסכום התכנון גבוה מהמינימום הנדרש לפי סיווג הפרויקט",
     "R_27": "בדיקת אם קיימת חריגה של מעל ל- 10% בין הביצוע בפועל לתכנון.",
     "R_28": "בדיקה שהקוטר הכי גדול שבוצע אינו שונה מהכי גדול שתוכנן",
@@ -541,12 +545,17 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
         s = str(v).strip().lower()
         return s in ("fail", "נכשל")
 
-    # Same KPI logic as the CLI printing logic
-    # Total = number of sub-checks (rows in group). Fail = count of failed sub-checks.
-    def _kpi_counts(gdf: pd.DataFrame) -> tuple[int, int]:
-        total = len(gdf)
-        fail = sum(1 for s in gdf["status"].tolist() if _status_is_fail(s))
-        return fail, total
+    def _status_is_pass(v: object) -> bool:
+        s = str(v).strip().lower()
+        return s in ("pass", "עבר")
+
+    # Total = number of sub-checks (rows in group). Fail = count of failed. Pass = count of passed.
+    def _kpi_counts(gdf: pd.DataFrame) -> tuple[int, int, int]:
+        statuses = gdf["status"].tolist()
+        total = len(statuses)
+        fail = sum(1 for s in statuses if _status_is_fail(s))
+        pass_ct = sum(1 for s in statuses if _status_is_pass(s))
+        return fail, total, pass_ct
 
     def _compact_int_ranges(nums: list[int]) -> str:
         nums = sorted({int(n) for n in nums if n is not None})
@@ -645,7 +654,7 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
 
     rows_out = []
     for (file_stem, check_id), gdf in df.groupby(["שם קובץ", "check_id"], dropna=False):
-        fail, total = _kpi_counts(gdf)
+        fail, total, pass_ct = _kpi_counts(gdf)
         rows_out.append({
             "רשות מקומית": _pick_first_nonempty(gdf["רשות מקומית"]),
             "שם קובץ": str(file_stem),
@@ -653,7 +662,7 @@ def build_summary_table(all_checks_df: pd.DataFrame) -> pd.DataFrame:
             "שם הבדיקה": _pick_first_nonempty(gdf["rule_name"]),
             "פירוט הבדיקה": RULE_DETAILS.get(str(check_id), ""),
             "מיקום הבדיקה": _location_from_group(gdf),
-            "ממצאים": f"{check_id}: {fail}/{total} {'FAIL' if fail > 0 else 'Pass'}",
+            "ממצאים": f"{check_id}: {pass_ct}/{total} {'Pass' if fail == 0 else 'FAIL'}",
             "סטטוס": _status_rollup(fail, total),
             "הערות": "",
             "הערת משתמש":  "",
@@ -720,58 +729,174 @@ def build_executive_summary_prompt(
     plan_file: str,
 ) -> str:
     """
-    Build a compact Hebrew LLM prompt for executive summary.
-    Minimises token usage by sending only aggregated stats.
+    Build an English-instruction prompt that produces a regulator-style Hebrew executive summary.
+    Engineering findings from R_16, R_18, R_21, R_23, R_24, R_25 are extracted and injected
+    as explicit bullet points so the LLM can cite them without hallucinating.
     """
+    import json as _json
+
     df = file_checks_df.copy()
 
     fail_mask = df["status"].isin(["Fail", "נכשל"])
     total = len(df)
     fail_count = int(fail_mask.sum())
     pass_count = int(df["status"].isin(["Pass", "עבר"]).sum())
-    info_count = total - fail_count - pass_count
+    info_count = total - fail_count - pass_count  # Not Applicable / INFO rows
 
     year = _extract_year_from_filename(plan_file)
     yr = f"{year}-{int(year)+4}" if year else "?"
 
-    # Top 5 failing rules (compact: "R_1:4, R_12:3, ...")
-    top_fails = ""
-    if fail_count > 0 and "rule_id" in df.columns:
-        fc = df[fail_mask].groupby("rule_id").size().sort_values(ascending=False).head(5)
-        top_fails = ", ".join(f"{_extract_check_id(r)}:{c}" for r, c in fc.items())
+    def _rule_fails(prefix: str) -> "pd.DataFrame":
+        if "rule_id" not in df.columns:
+            return df.iloc[0:0]
+        return df[df["rule_id"].str.startswith(prefix) & fail_mask]
 
-    # R_24 short pipes summary (one line)
-    r24 = ""
+    # ── Step 1: Macro positive findings (R_1 Kinun, R_2 Asset Ratios) ─────────
+    macro_findings: list[str] = []
+
     if "rule_id" in df.columns:
-        r24m = df["rule_id"].str.startswith("R_24")
-        if r24m.any():
-            r24f = int(df.loc[r24m & fail_mask].shape[0])
-            r24t = int(r24m.sum())
-            r24 = f"R_24 פרויקטים קטנים: {r24f}/{r24t} כשלונות"
+        r1_fails = _rule_fails("R_1")
+        if r1_fails.empty and df["rule_id"].str.startswith("R_1").any():
+            macro_findings.append(
+                "POSITIVE — Kinun values: ערכי הכינון המדווחים תואמים לנתוני רשות המים ונמצאו תקינים לחלוטין."
+            )
 
-    # R_3: emphasize in executive summary
-    r3_note = ""
-    if "rule_id" in df.columns and df["rule_id"].str.startswith("R_3").any():
-        r3_note = (
-            "חשוב – כלול והדגש בסיכום: \"לציין את הערך שהוגדר - צריך להכנס לסיכום מנהלים. "
-            "בהמשך יתבצעו בדיקות ביחס לערכים אלו.\"\n"
+        # R_3 rows (column R, rows 20-22) hold the actual % values for מים, ביוב, סה"כ
+        r3_rows = df[df["rule_id"].str.startswith("R_3")]
+        if not r3_rows.empty:
+            _label_map = {"מים": None, "ביוב": None, "סהכ": None}
+            for _, r3r in r3_rows.iterrows():
+                rid = str(r3r.get("rule_id", ""))
+                av = r3r.get("actual_value")
+                for key in _label_map:
+                    if rid.endswith(key) and av is not None:
+                        # actual_value may be "48.82%" or a float; extract the number
+                        try:
+                            _label_map[key] = round(float(str(av).replace("%", "").strip()), 1)
+                        except (TypeError, ValueError):
+                            _label_map[key] = av
+            _display = {"מים": _label_map["מים"], "ביוב": _label_map["ביוב"], 'סה"כ': _label_map["סהכ"]}
+            asset_ratio_table = (
+                "| תחום | יחס נכסים |\n"
+                "| :--- | :--- |\n"
+                + "\n".join(
+                    f"| {label} | {(str(val) + '%') if val is not None else 'N/A'} |"
+                    for label, val in _display.items()
+                )
+            )
+            macro_findings.append(
+                f"POSITIVE — Asset ratios: יחסי ההשקעות לנכסים נמצאו תקינים ועומדים במינימום הנדרש:\n\n"
+                f"{asset_ratio_table}"
+            )
+
+    # ── Step 2: Engineering failure findings (R_23, R_24, R_21, R_18, R_16, R_25) ──
+    findings: list[str] = []
+
+    # R_23: cost-per-meter outliers
+    r23 = _rule_fails("R_23")
+    if not r23.empty:
+        costs = []
+        for _, row in r23.iterrows():
+            av = row.get("actual_value", {})
+            if isinstance(av, str):
+                try:
+                    av = _json.loads(av.replace("'", '"'))
+                except Exception:
+                    av = {}
+            if isinstance(av, dict) and "cost_per_meter_nis" in av:
+                costs.append(round(float(av["cost_per_meter_nis"]), 0))
+        if costs:
+            findings.append(
+                f"- Pipe cost-per-meter anomalies: {len(r23)} projects deviate from the "
+                f"regulator baseline (0.15 × diameter × 1000 ₪/m ±20%). "
+                f"Observed range: {int(min(costs))}–{int(max(costs))} ₪/m."
+            )
+        else:
+            findings.append(
+                f"- Pipe cost-per-meter anomalies: {len(r23)} projects deviate from the regulatory baseline."
+            )
+
+    # R_24: short pipes
+    r24_per_row = _rule_fails("R_24")
+    short_pipe_rows = (
+        r24_per_row[r24_per_row["method"].eq("ShortPipeLength")]
+        if "method" in r24_per_row.columns else r24_per_row.iloc[0:0]
+    )
+    if not short_pipe_rows.empty:
+        findings.append(
+            f"- Short pipe segments (<100 m): {len(short_pipe_rows)} projects — "
+            f"קו קצר מ-100 מטר ללא הסבר נלווה."
         )
 
-    prompt = (
-        f"כתוב תקציר מנהלים קצר (עד 150 מילים) בעברית.\n"
-        f"תאגיד: {utility_name}, שנים: {yr}\n"
-        f"בדיקות: {total} (עברו:{pass_count} נכשלו:{fail_count} אחר:{info_count})\n"
-    )
-    if top_fails:
-        prompt += f"בדיקות עם הכי הרבה כשלונות: {top_fails}\n"
-    if r24:
-        prompt += f"{r24}\n"
-    if r3_note:
-        prompt += r3_note
-    prompt += (
-        "כלול: סיכום מצב, דפוסים חוזרים, המלצות מקצועיות.\n"
-        "אל תמציא נתונים."
-    )
+    # R_21: missing rehab/development split rows
+    r21 = _rule_fails("R_21")
+    if not r21.empty:
+        findings.append(
+            f"- Diameter jump without mandatory split row: {len(r21)} projects with "
+            f"planned diameter >2\" above existing have no matching 'פיתוח'/'שדרוג' row."
+        )
+
+    # R_18: facility / drilling data gaps
+    r18 = _rule_fails("R_18")
+    if not r18.empty:
+        findings.append(
+            f"- Missing mandatory facility/drilling data: {len(r18)} projects "
+            f"(שיקום ושדרוג — מתקני מים/ביוב/קידוחים) are missing required fields "
+            f"(שנת הקמה, סוג מתקן, נפח/ספיקה, or X marks in Q–U)."
+        )
+
+    # R_16: wells misclassified
+    r16 = _rule_fails("R_16")
+    if not r16.empty:
+        names = r16["key_context"].dropna().unique().tolist()[:4]
+        names_str = ", ".join(str(n) for n in names)
+        findings.append(
+            f"- Wells misclassified: {len(r16)} projects with 'באר/בארות' in their name "
+            f"are classified as 'מתקני מים' instead of 'קידוחים'."
+            + (f" Projects: {names_str}." if names_str else "")
+        )
+
+    # R_25: invalid delimiters
+    r25 = _rule_fails("R_25")
+    if not r25.empty:
+        findings.append(
+            f"- Invalid delimiters in pipe data columns J–M: {len(r25)} cells use '+', '/', "
+            f"or '-' instead of the required colon ':' separator."
+        )
+
+    # ── Step 3: Combine macro positives + engineering failures ────────────────
+    all_lines = macro_findings + (findings if findings else ["- No specific engineering anomalies detected."])
+    engineering_findings_text = "\n".join(all_lines)
+
+    prompt = f"""
+You are Michal Peleg Lubovsky, Engineering Control Manager at the Israeli Water Authority.
+Your task is to write a formal, dry, and highly professional audit email (מייל בקרה הנדסית) in Hebrew, addressed to the management of the water utility '{utility_name}' regarding their investment plan for {yr}.
+
+General Audit Stats:
+- Total checks performed: {total}
+- Passed successfully: {pass_count}
+- Failed/Anomalies: {fail_count}
+- Not Applicable / Skipped: {info_count} (This explains the math: Total = Passed + Failed + Not Applicable).
+
+Here are the specific macro and engineering findings from the system:
+{engineering_findings_text}
+
+OUTPUT FORMAT AND STYLE RULES:
+1. **DO NOT** write an "Executive Summary". Write a formal email starting exactly with: "שלום רב,\nלהלן ריכוז ממצאים והערות לבקרת תוכנית ההשקעות לשנת {year}:"
+2. **Contextual Math:** In the opening, briefly state the stats, e.g., "בוצעו {total} בדיקות, מתוכן {fail_count} נמצאו כחורגות ({info_count} סווגו כלא-רלוונטיות לשורות הספציפיות)."
+3. **Structuring the Findings:** Group the findings logically using bullet points:
+   - נתוני מאקרו ויחסי השקעה (Include the POSITIVE Kinun and Asset Ratio notes marked above. **Preserve the Markdown table for Asset Ratios exactly as provided — do not reformat it into prose.**).
+   - סבירות כלכלית (Economic Feasibility — cost per meter anomalies).
+   - לוגיקה הנדסית (Engineering Logic — short pipes, diameter splits).
+   - חוסר בשלמות נתונים (Data Integrity — missing facility/drilling data, illegal delimiters).
+4. **Tone:** Dry, technical, direct. Give positive credit where due (e.g., Kinun), but be firm on the failures. Do NOT use dramatic words like "מעוררת דאגה", "קיצוני", or "מדד אמת". Use regulatory language like "נמצאה חריגה מנוסחת הבסיס", "יש לפצל את הפרויקט", "חסרים נתוני חובה".
+5. **No Hallucinations / No Meta-Text:** Do NOT invent general warnings. If a rule passed, state it passed. Do NOT print rule IDs (like R_23) or meta-tags in the output.
+6. **Closing:** End the email exactly with:
+"נא התייחסותכם ותיקון הקובץ בהתאם.
+בברכה,
+מיכל פלג לובובסקי
+בקרה הנדסית, הרשות הממשלתית למים ולביוב"
+"""
     return prompt
 
 
@@ -788,12 +913,6 @@ def generate_executive_summaries(
     if not cfg.llm_enabled:
         return {}
 
-    # Fixed R_3 emphasis to prepend to executive summary when R_3 was run
-    R_3_EMPHASIS = (
-        "【 הדגשה 】 לציין את הערך שהוגדר - צריך להכנס לסיכום מנהלים. "
-        "בהמשך יתבצעו בדיקות ביחס לערכים אלו.\n\n"
-    )
-
     summaries = {}
     for (utility, plan_file), gdf in all_checks_df.groupby(["utility_name", "plan_file"]):
         prompt = build_executive_summary_prompt(gdf, str(utility), str(plan_file))
@@ -803,8 +922,6 @@ def generate_executive_summaries(
                 provider=cfg.llm_provider,
                 model=cfg.llm_model,
             )
-            if "rule_id" in gdf.columns and gdf["rule_id"].str.startswith("R_3").any():
-                text = R_3_EMPHASIS + text
             summaries[str(utility)] = text
         except LLMQuotaError:
             summaries[str(utility)] = "שגיאה: חריגת מכסת LLM. לא ניתן ליצור תקציר."
