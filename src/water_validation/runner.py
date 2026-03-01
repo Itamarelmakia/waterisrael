@@ -87,7 +87,31 @@ def run_summary_sheet_checks(
     cfg = cfg or PlanConfig()
 
     plan_df, _info = load_plan_sheet_with_header_fix(plan_file, cfg)
-    utility = extract_utility_from_plan_filename(plan_file)
+
+    try:
+        utility = extract_utility_from_plan_filename(plan_file)
+    except ValueError:
+        # Filename does not contain a recognisable city/utility name.
+        # Fall back: read cell E1 from "גיליון דיווח" sheet.
+        try:
+            _fb = pd.read_excel(
+                plan_file,
+                sheet_name=cfg.report_sheet_name,
+                header=None,
+                nrows=1,
+                usecols="E",
+            )
+            utility = str(_fb.iloc[0, 0]).strip().replace("_", " ")
+            if not utility or utility.lower() == "nan":
+                raise ValueError("E1 is empty")
+            print(f"[runner] utility name read from {cfg.report_sheet_name}!E1: '{utility}'")
+        except Exception as _e2:
+            raise ValueError(
+                f"Cannot determine utility name: filename parse failed and "
+                f"{cfg.report_sheet_name}!E1 fallback failed ({_e2}). "
+                f"File: {Path(plan_file).name}"
+            )
+
     print(f"\n=== {Path(plan_file).name} ===")
 
     kinun_json_path = Path(kinun_file) if kinun_file else KINUN_VALUES_PATH

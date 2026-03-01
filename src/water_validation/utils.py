@@ -97,6 +97,8 @@ def extract_utility_from_plan_filename(plan_file: str | Path) -> str:
             if city:
                 return city
 
+    # Strategy 3: filename ends with "_דיווח NNNN" — the numeric code is not a city name,
+    # so we signal to the caller to fall back to the Excel file content.
     raise ValueError(f"Cannot extract utility/city from filename: {stem}")
 
 
